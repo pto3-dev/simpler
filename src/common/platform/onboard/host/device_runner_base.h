@@ -617,6 +617,12 @@ public:
     virtual LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) = 0;
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
 
+    // Graph resources remain pinned until finalize, after the consumer destroys
+    // its graph. Unsupported platforms reject this opt-in path explicitly.
+    virtual int prepare_graph_execution(PreparedExecution &) { return PTO_RUNTIME_ERR_INTERNAL; }
+    virtual int enqueue_graph_execution(PreparedExecution &, void *) { return PTO_RUNTIME_ERR_INTERNAL; }
+    virtual int finish_graph_execution(PreparedExecution &) { return 0; }
+
     /**
      * Query the active run without waiting. Returns one of the
      * SIMPLER_NATIVE_RUN_POLL_* values.

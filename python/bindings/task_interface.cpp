@@ -3100,6 +3100,17 @@ NB_MODULE(_task_interface, m) {
             "Launch a prepared native run and return after its real device launch fence."
         )
         .def(
+            "_prepare_graph_run", &ChipWorker::prepare_graph_run,
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Pin a device-tensor-only callable for stream graph capture and replay."
+        )
+        .def(
+            "_enqueue_graph_run", &ChipWorker::enqueue_graph_run, nb::arg("run"), nb::arg("stream"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Enqueue a pinned callable and join its device streams into the caller's stream."
+        )
+        .def(
             "_poll_native_run", &ChipWorker::poll_native_run, nb::arg("run"),
             "Return whether a launched native run has reached its completion fence."
         )

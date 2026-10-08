@@ -100,6 +100,9 @@ public:
     ) override;
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
+    int prepare_graph_execution(PreparedExecution &prepared) override;
+    int enqueue_graph_execution(PreparedExecution &prepared, void *stream) override;
+    int finish_graph_execution(PreparedExecution &prepared) override;
     int poll_execution(const ActiveExecution &active) override;
     int drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
@@ -186,6 +189,14 @@ public:
     size_t run_stream_set_create_count() const override { return run_streams_.created_count(); }
 
 private:
+    struct GraphEvents {
+        rtEvent_t start{nullptr};
+        rtEvent_t aicore_done{nullptr};
+        rtEvent_t aicpu_done{nullptr};
+        rtStream_t consumer{nullptr};
+        void *reset_image{nullptr};
+    };
+    std::unordered_map<PreparedExecution *, GraphEvents> graph_events_;
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached

@@ -222,6 +222,13 @@ class TestChipWorkerStateMachine:
         with pytest.raises(RuntimeError, match="not initialized"):
             worker.run(0, args, config)
 
+    def test_prepare_graph_run_before_init_raises(self):
+        from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker._prepare_graph_run(0, ChipStorageTaskArgs(), CallConfig())
+
     def test_unregister_callable_before_init_raises(self):
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="not initialized"):
@@ -299,6 +306,53 @@ class TestChipWorkerPython:
         worker = ChipWorker()
         with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.register_callable"):
             worker.run(0, ChipStorageTaskArgs(), CallConfig())  # pyright: ignore[reportArgumentType]
+
+    def test_public_wrapper_graph_run_uses_private_slot_and_native_token(self):
+        from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        native_token = object()
+
+        class FakeImpl:
+            initialized = True
+            device_id = 0
+
+            def __init__(self):
+                self.prepared_callables = []
+                self.graph_prepares = []
+                self.graph_enqueues = []
+                self.graph_finalizes = []
+
+            def register_callable(self, slot, callable_obj):
+                self.prepared_callables.append((slot, callable_obj))
+
+            def _prepare_graph_run(self, slot, args, config):
+                self.graph_prepares.append((slot, args, config))
+                return native_token
+
+            def _enqueue_graph_run(self, run, stream):
+                self.graph_enqueues.append((run, stream))
+
+            def _finalize_native_run(self, run):
+                self.graph_finalizes.append(run)
+
+        worker = ChipWorker()
+        fake = FakeImpl()
+        worker._impl = fake
+        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+        handle = worker.register_callable(callable_obj)
+        args = ChipStorageTaskArgs()
+
+        assert worker.prepare_graph_run(handle, args) is native_token
+        assert fake.graph_prepares[0][0] == 0
+        assert fake.graph_prepares[0][1] is args
+        assert isinstance(fake.graph_prepares[0][2], CallConfig)
+
+        worker.enqueue_graph_run(native_token, 1234)
+        worker.finalize_graph_run(native_token)
+
+        assert fake.graph_enqueues == [(native_token, 1234)]
+        assert fake.graph_finalizes == [native_token]
 
     def test_public_wrapper_rejects_cross_thread_finalize(self):
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]

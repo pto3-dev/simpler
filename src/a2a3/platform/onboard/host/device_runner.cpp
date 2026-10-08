@@ -683,6 +683,94 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     return result;
 }
 
+int DeviceRunner::prepare_graph_execution(PreparedExecution &prepared) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if (prepared.config.diagnostics_any() || graph_events_.count(&prepared) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+    int rc = ensure_run_streams();
+    if (rc != 0) return rc;
+    // Legacy events cannot participate in global capture. Match Torch-NPU's
+    // reusable event API, while keeping ordinary execution compatible with
+    // older CANN versions which do not export this graph-only entry point.
+    using CreateCaptureEvent = aclError (*)(aclrtEvent *, uint32_t);
+    auto create_event = reinterpret_cast<CreateCaptureEvent>(dlsym(RTLD_DEFAULT, "aclrtCreateEventExWithFlag"));
+    if (create_event == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    auto &events = graph_events_[&prepared];
+    for (rtEvent_t *event : {&events.start, &events.aicore_done, &events.aicpu_done}) {
+        rc = create_event(event, ACL_EVENT_SYNC);
+        if (rc != 0) {
+            (void)finish_graph_execution(prepared);
+            return rc;
+        }
+    }
+    // Reset the complete device launch descriptor, including handshake and
+    // completion flags, with a captured D2D copy on every replay. The snapshot
+    // contains fixed tensor addresses, not their changing contents.
+    const size_t reset_bytes = runtime_device_copy_size(*prepared.runtime);
+    events.reset_image = allocate_tensor(reset_bytes);
+    if (events.reset_image == nullptr) {
+        (void)finish_graph_execution(prepared);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    rc = copy_to_device(events.reset_image, prepared.runtime, reset_bytes);
+    if (rc != 0) {
+        (void)finish_graph_execution(prepared);
+        return rc;
+    }
+    activate_launch_shape(*prepared.runtime);
+    return 0;
+}
+
+int DeviceRunner::enqueue_graph_execution(PreparedExecution &prepared, void *stream) {
+    auto it = graph_events_.find(&prepared);
+    if (it == graph_events_.end() || stream == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    auto &events = it->second;
+    auto consumer = static_cast<rtStream_t>(stream);
+    // Eager warmup and the subsequent graph capture may use different streams.
+    // The caller drains warmup before capture and owns replay serialization.
+    events.consumer = consumer;
+    auto aicore = static_cast<rtStream_t>(run_streams_.aicore());
+    auto aicpu = static_cast<rtStream_t>(run_streams_.aicpu());
+    const size_t reset_bytes = runtime_device_copy_size(*prepared.runtime);
+    int rc = rtMemcpyAsync(
+        prepared.kernel_args.args.runtime_args, reset_bytes, events.reset_image,
+        reset_bytes, RT_MEMCPY_DEVICE_TO_DEVICE, consumer
+    );
+    if (rc != 0) { LOG_ERROR("graph reset D2D failed: %d", rc); return rc; }
+    // The persistent AICore and AICPU kernels need concurrent streams. Fork
+    // from, then join back into, the graph owner's stream using capture events.
+    if ((rc = aclrtRecordEvent(events.start, consumer)) != 0) { LOG_ERROR("graph start record failed: %d", rc); return rc; }
+    if ((rc = aclrtStreamWaitEvent(aicore, events.start)) != 0) { LOG_ERROR("graph AICore fork failed: %d", rc); return rc; }
+    if ((rc = aclrtStreamWaitEvent(aicpu, events.start)) != 0) { LOG_ERROR("graph AICPU fork failed: %d", rc); return rc; }
+    if ((rc = launch_aicore_kernel(aicore, prepared.kernel_args.device_k_args_)) != 0) return rc;
+    int launch_n = prepared.runtime->get_aicpu_launch_count();
+    if ((rc = launch_aicpu_kernel(aicpu, &prepared.kernel_args.args, host::KernelNames::RunName, launch_n)) != 0)
+        return rc;
+    if ((rc = aclrtRecordEvent(events.aicore_done, aicore)) != 0) return rc;
+    if ((rc = aclrtRecordEvent(events.aicpu_done, aicpu)) != 0) return rc;
+    if ((rc = aclrtStreamWaitEvent(consumer, events.aicore_done)) != 0) return rc;
+    return aclrtStreamWaitEvent(consumer, events.aicpu_done);
+}
+
+int DeviceRunner::finish_graph_execution(PreparedExecution &prepared) {
+    auto it = graph_events_.find(&prepared);
+    if (it == graph_events_.end()) return 0;
+    auto &events = it->second;
+    if (events.consumer != nullptr) {
+        int rc = aclrtSynchronizeStreamWithTimeout(events.consumer, timeout_config_.stream_sync_timeout_ms);
+        if (rc != 0) return rc;
+        // A failed partial submission may not have joined both child streams
+        // back to the consumer. Drain them before releasing captured storage.
+        rc = sync_stream_pair(run_streams_.aicpu(), run_streams_.aicore());
+        if (rc != 0) return rc;
+    }
+    for (rtEvent_t event : {events.start, events.aicore_done, events.aicpu_done}) {
+        if (event != nullptr) (void)aclrtDestroyEvent(event);
+    }
+    if (events.reset_image != nullptr) free_tensor(events.reset_image);
+    graph_events_.erase(it);
+    return 0;
+}
+
 int DeviceRunner::reap_run() {
     if (!run_streams_.ready()) {
         LOG_ERROR("reap_run: the run stream pair is not ready");
