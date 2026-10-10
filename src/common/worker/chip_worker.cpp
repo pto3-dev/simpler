@@ -771,6 +771,41 @@ void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
 
+ChipWorkerNativeRun ChipWorker::prepare_graph_run(
+    int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config
+) {
+    // A graph owns the runner exclusively; only its device-owned backing
+    // tensors may be updated between replays. Host staging cannot be replayed.
+    if (config.diagnostics_any()) throw std::runtime_error("graph replay does not support per-run diagnostics");
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        if (!args.tensor(i).is_device_memory()) {
+            throw std::runtime_error("graph replay requires device-owned tensor arguments");
+        }
+    }
+    auto run = prepare_native_run_on_slot(callable_id, &args, config, 0, 0, 0, 0, nullptr, 0, false);
+    try {
+        auto fn = load_symbol<decltype(&simpler_prepare_graph_run)>(lib_handle_, "simpler_prepare_graph_run");
+        int rc = fn(device_ctx_, runtime_bufs_[run.slot_id].data());
+        if (rc != 0) throw std::runtime_error("prepare_graph_run failed with code " + std::to_string(rc));
+    } catch (...) {
+        finalize_native_run(run);
+        throw;
+    }
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    native_run_states_[run.slot_id].phase = NativeRunPhase::GRAPH_READY;
+    return run;
+}
+
+void ChipWorker::enqueue_graph_run(const ChipWorkerNativeRun &run, uint64_t stream) {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    if (run.slot_id >= runtime_bufs_.size() || native_run_states_[run.slot_id].run_epoch != run.run_epoch ||
+        native_run_states_[run.slot_id].phase != NativeRunPhase::GRAPH_READY || stream == 0)
+        throw std::runtime_error("graph run token is stale, unprepared, or has no stream");
+    auto fn = load_symbol<decltype(&simpler_enqueue_graph_run)>(lib_handle_, "simpler_enqueue_graph_run");
+    int rc = fn(device_ctx_, runtime_bufs_[run.slot_id].data(), reinterpret_cast<void *>(stream));
+    if (rc != 0) throw std::runtime_error("enqueue_graph_run failed with code " + std::to_string(rc));
+}
+
 void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -857,7 +892,8 @@ void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
         }
         NativeRunSlotState &state = native_run_states_[run.slot_id];
         if (state.run_epoch != run.run_epoch ||
-            (state.phase != NativeRunPhase::PREPARED && state.phase != NativeRunPhase::LAUNCHED &&
+            (state.phase != NativeRunPhase::PREPARED && state.phase != NativeRunPhase::GRAPH_READY &&
+             state.phase != NativeRunPhase::LAUNCHED &&
              state.phase != NativeRunPhase::REAPED)) {
             throw std::runtime_error("native-run token is stale or already finalized");
         }
@@ -876,6 +912,13 @@ void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
         throw;
     }
     int finalize_rc = finalize_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
+    if (phase == NativeRunPhase::GRAPH_READY && finalize_rc != 0) {
+        // A failed drain must retain the token and the device addresses still
+        // referenced by the graph. The caller may retry after destroying it.
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        native_run_states_[run.slot_id].phase = phase;
+        throw std::runtime_error("graph finalization failed with code " + std::to_string(finalize_rc));
+    }
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         native_run_states_[run.slot_id] = NativeRunSlotState{};

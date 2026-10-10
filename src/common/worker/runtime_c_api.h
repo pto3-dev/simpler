@@ -443,6 +443,12 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
+/** Pin a prepared run for graph replay. Call before stream capture. */
+int simpler_prepare_graph_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/** Enqueue a pinned run on a caller-owned stream; no allocation or host wait. */
+int simpler_enqueue_graph_run(DeviceContextHandle ctx, RuntimeHandle runtime, void *stream);
+
 /**
  * Non-blocking device-completion query. Returns
  * SIMPLER_NATIVE_RUN_POLL_NOT_READY, SIMPLER_NATIVE_RUN_POLL_COMPLETE, or a

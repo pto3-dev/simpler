@@ -1635,6 +1635,25 @@ class ChipWorker:
     def _launch_native_run(self, run):
         self._impl._launch_native_run(run)
 
+    def prepare_graph_run(self, handle, args, config=None):
+        """Pin a callable before capture; retain its NPU buffers until close.
+
+        Stop replay, drain all replay streams, and destroy the consumer graph
+        before finalizing the returned token. Keep every argument's device
+        storage alive until then. Preparation must run outside capture.
+        The runner is reserved exclusively for this graph's lifetime.
+        """
+        state = self._resolve_handle(handle)
+        return self._impl._prepare_graph_run(state.slot_id, args, config or CallConfig())
+
+    def enqueue_graph_run(self, run, stream):
+        """Enqueue without host synchronization on a caller-owned NPU stream."""
+        self._impl._enqueue_graph_run(run, int(stream))
+
+    def finalize_graph_run(self, run):
+        """Release a graph token after draining replay and destroying its graph."""
+        self._impl._finalize_native_run(run)
+
     def _poll_native_run(self, run):
         return bool(self._impl._poll_native_run(run))
 

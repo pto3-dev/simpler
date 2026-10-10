@@ -154,6 +154,8 @@ public:
         volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
     );
     void close_chip_run_lane();
+    ChipWorkerNativeRun prepare_graph_run(int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config);
+    void enqueue_graph_run(const ChipWorkerNativeRun &run, uint64_t stream);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -364,7 +366,7 @@ private:
 
     uint32_t arena_bank_for_slot(uint32_t slot_id) const;
 
-    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, FINALIZING };
+    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, GRAPH_READY, LAUNCHED, REAPED, FINALIZING };
     class PreparedRunIncompatible : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;

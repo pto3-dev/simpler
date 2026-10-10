@@ -881,7 +881,8 @@ int simpler_prepare_run(
 
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run");
-    if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
+    if (state == nullptr || state->graph_prepared ||
+        state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
         return PTO_RUNTIME_ERR_INTERNAL;
     // TEMPORARY (host_build_graph dsv4 bring-up): stop after prepare so the host
     // side — orchestration, graph construction, image relocation and H2D — can be
@@ -945,6 +946,41 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     state->completion_rc = 0;
     state->phase.store(NativeRunPhase::Running, std::memory_order_release);
     return 0;
+}
+
+int simpler_prepare_graph_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    auto *state = native_run_context(ctx, runtime, "simpler_prepare_graph_run");
+    if (state == nullptr || state->graph_prepared || state->config.diagnostics_any() ||
+        state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+        state->prepared_execution == nullptr || !state->runner->can_accept_run()) return PTO_RUNTIME_ERR_INTERNAL;
+    if (!state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    state->runner_claimed = true;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = state->runner->prepare_graph_execution(*state->prepared_execution);
+    } catch (...) {
+        // A C ABI must not propagate a C++ exception to its caller. Preparation
+        // can have created some capture resources before an allocation failed.
+        (void)state->runner->finish_graph_execution(*state->prepared_execution);
+        state->runner->release_native_run(state);
+        state->runner_claimed = false;
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) {
+        state->runner->release_native_run(state);
+        state->runner_claimed = false;
+        return rc;
+    }
+    state->graph_prepared = true;
+    return 0;
+}
+
+int simpler_enqueue_graph_run(DeviceContextHandle ctx, RuntimeHandle runtime, void *stream) {
+    auto *state = native_run_context(ctx, runtime, "simpler_enqueue_graph_run");
+    if (state == nullptr || !state->graph_prepared || !state->runner_claimed || stream == nullptr ||
+        state->prepared_execution == nullptr || !state->runner->can_accept_run()) return PTO_RUNTIME_ERR_INTERNAL;
+    return state->runner->enqueue_graph_execution(*state->prepared_execution, stream);
 }
 
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
@@ -1020,6 +1056,13 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     }
     if (attach_rc != 0) {
         LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+    }
+    if (state->graph_prepared) {
+        if (attach_rc != 0) return attach_rc;
+        int graph_rc = state->runner->finish_graph_execution(*state->prepared_execution);
+        // Never free captured pointers while a graph stream is still live.
+        if (graph_rc != 0) return graph_rc;
+        state->graph_prepared = false;
     }
     if (phase == NativeRunPhase::Running && launched) {
         int drain_rc = attach_rc;

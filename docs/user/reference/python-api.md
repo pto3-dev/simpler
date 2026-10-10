@@ -97,6 +97,39 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
+## Experimental caller-owned NPU graph execution
+
+`ChipWorker` in `simpler.task_interface` exposes a low-level graph path for
+onboard `a2a3` with `tensormap_and_ringbuffer`. It is not `Worker.submit()` and
+does not support simulation, `host_build_graph`, or diagnostic collectors.
+Use a dedicated worker: preparation reserves the runner until finalization.
+
+| Method | Boundary |
+| ------ | -------- |
+| `prepare_graph_run(handle, args, config=None)` | Outside capture: bind one `ChipCallable`, pin the arena, runtime descriptor, and launch resources; return a run token |
+| `enqueue_graph_run(token, stream_address)` | Inside capture or eager warmup: enqueue a device reset and AICore/AICPU launch pair, with event dependencies back to the caller's stream; no host wait |
+| `finalize_graph_run(token)` | After replay has stopped, replay streams have drained, and every graph referencing the token has been destroyed: release pinned resources |
+
+All tensor arguments must name existing device memory (`child_memory=True`).
+The caller owns that storage and must keep it alive until finalization. Update
+contents at the same addresses; changing Python argument objects after capture
+does not change a captured launch. Shape, dtype, callable, and configuration
+remain fixed. Serial replay is required; concurrent graphs cannot share this
+runner. A graph captures one `ChipCallable` launch, whose device orchestration
+can submit many child `CoreCallable` tasks through Simpler's scheduler.
+
+The capture stream forks to separate persistent AICore/AICPU streams and joins
+them with capture-compatible ACL events. The device launch descriptor is reset
+by a captured D2D copy on each replay. Compilers, allocations, host-side
+diagnostics, and ordinary `run()`/`wait()` calls must stay outside capture.
+
+Before teardown, drain the actual replay streams, not only the original capture
+stream. For a Torch-NPU owner: stop replay, `torch.npu.synchronize(device_id)`,
+`graph.reset()`, `worker.finalize_graph_run(token)`, then `worker.finalize()`.
+This API does not make an arbitrary callable numerically correct or prove that
+an entire model is graph-compatible; validate changed inputs and repeated
+replays against an eager golden result.
+
 ## Callables and task args
 
 ```python

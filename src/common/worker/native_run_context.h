@@ -87,6 +87,7 @@ struct NativeRunContext {
     bool runner_resources_owned{false};
     bool runner_reserved{false};
     bool runner_claimed{false};
+    bool graph_prepared{false};
 
     NativeRunIdentity identity() const {
         return NativeRunIdentity{
