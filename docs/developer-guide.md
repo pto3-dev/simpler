@@ -256,6 +256,14 @@ pto_isa_root)` for a source containing one global entry. It targets the coupled
 The A1 path has its own tensor ABI include directory and does not provide graph
 orchestration or the persistent-worker `compile_incore` API.
 
+`A1SingleLaunch(kernel_object, device_id=0)` executes such an entry synchronously.
+The entry takes one GM pointer to an array of tensor descriptor addresses. Pass
+contiguous CPU tensors matching its static signature; FP16 and FP32 are supported.
+Use it as a context manager to drain and release its owned stream and context.
+All tensors are copied back after each call. Exact aliases preserve shared device
+storage; partially overlapping views are rejected. This path does not reset the
+device or finalize the process-wide ACL runtime.
+
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
 child `CoreCallable`) and uploaded as a single blob via
 `DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each
