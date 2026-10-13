@@ -260,7 +260,8 @@ orchestration or the persistent-worker `compile_incore` API.
 The entry takes one GM pointer to an array of tensor descriptor addresses. Pass
 contiguous CPU tensors matching its static signature; FP16 and FP32 are supported.
 Use it as a context manager to drain and release its owned stream and context.
-All tensors are copied back after each call. Exact aliases preserve shared device
+The managed ISA pin includes the A1 profile together with the existing runtime
+baseline fixes. All tensors are copied back after each call. Exact aliases preserve shared device
 storage; partially overlapping views are rejected. This path does not reset the
 device or finalize the process-wide ACL runtime.
 
