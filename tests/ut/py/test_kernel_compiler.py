@@ -137,3 +137,56 @@ def test_compile_cache_token_preserves_every_incore_toolchain_token(monkeypatch)
     token = compiler.compile_cache_token("host_build_graph", ["aiv", "aic"])
 
     assert token["incore"] == {"variants": [tokens["aic"], tokens["aiv"]]}
+
+
+@pytest.mark.parametrize("core_type", ["aic", "aiv"])
+def test_a1_uses_coupled_m200_target(monkeypatch, core_type):
+    from simpler_setup import toolchain  # noqa: PLC0415
+
+    compiler = toolchain.CCECToolchain.__new__(toolchain.CCECToolchain)
+    compiler.platform = "a1"
+    flags = compiler.get_compile_flags(core_type)
+    assert "--cce-aicore-arch=dav-m200" in flags
+    assert "-cce-aicore-stack-size=0x8000" not in flags
+    assert not any("dav-c220" in flag or "dav-c310" in flag for flag in flags)
+    with pytest.raises(ValueError, match="Unknown core type"):
+        compiler.get_compile_flags("invalid")
+
+
+def test_a1_global_object_does_not_use_worker_linker(monkeypatch, tmp_path):
+    from simpler_setup import kernel_compiler  # noqa: PLC0415
+
+    class DeviceToolchain:
+        cxx_path = "ccec"
+
+        def __init__(self, *_args):
+            pass
+
+        def get_compile_flags(self, **_kwargs):
+            return ["--cce-aicore-arch=dav-m200"]
+
+    monkeypatch.setattr(kernel_compiler.env_manager, "ensure", lambda _name: None)
+    monkeypatch.setattr(kernel_compiler, "CCECToolchain", DeviceToolchain)
+    monkeypatch.setattr(kernel_compiler, "Aarch64GxxToolchain", DeviceToolchain)
+    compiler = kernel_compiler.KernelCompiler("a1")
+    source = tmp_path / "kernel.cpp"
+    source.write_text("global entry")
+    isa = tmp_path / "isa"
+    (isa / "include" / "pto").mkdir(parents=True)
+    (isa / "include" / "pto" / "pto-inst.hpp").touch()
+    captured = {}
+
+    def capture(cmd, *_args, **kwargs):
+        captured.update(cmd=cmd, kwargs=kwargs)
+        return b"whole ELF object"
+
+    monkeypatch.setattr(compiler, "_compile_to_bytes", capture)
+    assert compiler.compile_single_launch(str(source), str(isa)) == b"whole ELF object"
+    assert captured["cmd"][0] == "ccec"
+    assert any("src/a1/platform/include" in part for part in captured["cmd"])
+    assert not any("a2a3" in part or "a5" in part for part in captured["cmd"])
+    assert captured["kwargs"]["delete_output"]
+    with pytest.raises(ValueError, match="graph orchestration is not available"):
+        compiler.get_orchestration_include_dirs("host_build_graph")
+    with pytest.raises(ValueError, match="No toolchain for platform"):
+        compiler.compile_incore(str(source), pto_isa_root=str(isa))

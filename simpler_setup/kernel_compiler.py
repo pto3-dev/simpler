@@ -110,18 +110,20 @@ class KernelCompiler:
         Initialize KernelCompiler.
 
         Args:
-            platform: Target platform ("a2a3" or "a2a3sim")
+            platform: Target platform ("a1", "a2a3", "a2a3sim", "a5", or "a5sim")
 
         Raises:
             ValueError: If platform is unknown
-            EnvironmentError: If ASCEND_HOME_PATH is not set for a2a3 platform
+            EnvironmentError: If ASCEND_HOME_PATH is not set for a hardware platform
             FileNotFoundError: If required compiler not found
         """
         self.platform = platform
         self.project_root = PROJECT_ROOT
 
         # Map platform to architecture directory
-        if platform in ("a2a3", "a2a3sim"):
+        if platform == "a1":
+            self.platform_dir = self.project_root / "src" / "a1" / "platform"
+        elif platform in ("a2a3", "a2a3sim"):
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
         elif platform in ("a5", "a5sim"):
             self.platform_dir = self.project_root / "src" / "a5" / "platform"
@@ -129,10 +131,10 @@ class KernelCompiler:
             raise ValueError(f"Unknown platform: {platform}")
 
         # Create toolchain objects based on platform
-        if platform in ("a2a3", "a5"):
+        if platform in ("a1", "a2a3", "a5"):
             env_manager.ensure("ASCEND_HOME_PATH")
             self.ccec = CCECToolchain(platform)
-            self.aarch64 = Aarch64GxxToolchain()
+            self.aarch64 = None if platform == "a1" else Aarch64GxxToolchain()
             self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
         else:
             self.ccec = None
@@ -181,6 +183,9 @@ class KernelCompiler:
             List of include directory paths:
             [runtime_dir, platform_host_dir, platform_include_dir]
         """
+        if self.platform == "a1":
+            raise ValueError("A1 supports compile_single_launch; graph orchestration is not available")
+
         # Map platform to runtime architecture
         if self.platform in ("a2a3", "a2a3sim"):
             arch = "a2a3"
@@ -229,6 +234,9 @@ class KernelCompiler:
         Returns:
             (include_dirs, source_files) — both as absolute paths, or ([], [])
         """
+        if self.platform == "a1":
+            raise ValueError("A1 supports compile_single_launch; graph orchestration is not available")
+
         # Map platform to runtime architecture
         if self.platform in ("a2a3", "a2a3sim"):
             arch = "a2a3"
@@ -294,6 +302,8 @@ class KernelCompiler:
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
+        if self.platform == "a1":
+            raise ValueError("A1 graph orchestration is not available")
         if runtime_name == "host_build_graph":
             return self.host_gxx
         if runtime_name == "tensormap_and_ringbuffer":
@@ -446,6 +456,39 @@ class KernelCompiler:
         fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
         os.close(fd)
         return path
+
+    def compile_single_launch(
+        self,
+        source_path: str,
+        pto_isa_root: str,
+        extra_include_dirs: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+    ) -> bytes:
+        """Compile an A1 global entry into the ELF object consumed by CANN.
+
+        The source must contain one ``__global__`` entry. This returns the
+        whole object for ``rtRegisterAllKernel``, rather than a text payload
+        for an A2/A3 or A5 persistent worker.
+        """
+        if self.platform != "a1":
+            raise ValueError("compile_single_launch requires platform='a1'")
+        source = Path(source_path).resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Source file not found: {source}")
+        include = Path(pto_isa_root).resolve() / "include"
+        if not (include / "pto" / "pto-inst.hpp").is_file():
+            raise FileNotFoundError(f"PTO-ISA headers not found: {include}")
+        assert self.ccec is not None
+        output = self._make_temp_path(prefix="a1_single_launch_", suffix=".o", build_dir=build_dir)
+        cmd = [self.ccec.cxx_path, *self.ccec.get_compile_flags(core_type="aic")]
+        includes = [str(include), *self.get_incore_include_dirs(), str(self.platform_dir / "include")]
+        includes.extend(
+            [str(self.project_root / "src" / "common"), str(self.project_root / "src" / "common" / "task_interface")]
+        )
+        includes.extend(extra_include_dirs or [])
+        cmd.extend(f"-I{compiler_visible_path(directory)}" for directory in includes)
+        cmd.extend(["-o", output, str(compiler_visible_path(str(source)))])
+        return self._compile_to_bytes(cmd, output, "A1 single launch", delete_output=build_dir is None)
 
     def compile_incore(
         self,

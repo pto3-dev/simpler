@@ -250,6 +250,12 @@ compiler = KernelCompiler(platform="a2a3sim")
 kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
 
+On Ascend310P, use `KernelCompiler(platform="a1").compile_single_launch(source,
+pto_isa_root)` for a source containing one global entry. It targets the coupled
+`dav-m200` core and returns the whole ELF object for CANN `rtRegisterAllKernel`.
+The A1 path has its own tensor ABI include directory and does not provide graph
+orchestration or the persistent-worker `compile_incore` API.
+
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
 child `CoreCallable`) and uploaded as a single blob via
 `DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each
