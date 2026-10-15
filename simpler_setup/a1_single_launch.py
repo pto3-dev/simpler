@@ -33,6 +33,10 @@ class _HostTensorArg(ctypes.Structure):
     ]
 
 
+class _ResidentArg(ctypes.Structure):
+    _fields_ = [("tensor", _HostTensorArg), ("offset", ctypes.c_uint64)]
+
+
 @lru_cache(maxsize=1)
 def _load_runtime() -> Any:
     env_manager.ensure("ASCEND_HOME_PATH")
@@ -82,6 +86,35 @@ def _load_runtime() -> Any:
     library.simpler_a1_close.restype = ctypes.c_int
     library.simpler_a1_last_error.argtypes = []
     library.simpler_a1_last_error.restype = ctypes.c_char_p
+    library.simpler_a1_tensor_create.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_HostTensorArg),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    library.simpler_a1_tensor_create.restype = ctypes.c_int
+    library.simpler_a1_tensor_copy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_ResidentArg),
+        ctypes.POINTER(_HostTensorArg),
+        ctypes.c_uint32,
+    ]
+    library.simpler_a1_tensor_copy.restype = ctypes.c_int
+    library.simpler_a1_register.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    library.simpler_a1_register.restype = ctypes.c_int
+    library.simpler_a1_run_resident.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_ResidentArg),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    ]
+    library.simpler_a1_run_resident.restype = ctypes.c_int
     return library
 
 
@@ -105,6 +138,81 @@ def _tensor_arg(tensor: Any) -> _HostTensorArg:
         1 if tensor.dtype == torch.float16 else 0,
         len(shape),
         (ctypes.c_uint32 * 5)(*(shape + [0] * (5 - len(shape)))),
+    )
+
+
+class A1DeviceTensor:
+    """Dense session-owned FP16/FP32 storage; explicit transfers only.
+
+    Views retain their owner and may change shape without changing dtype.
+    Session close invalidates all tensors and views. Individual storage is
+    released when the owning session closes, after its stream drains.
+    """
+
+    def __init__(
+        self,
+        owner: "A1SingleLaunch",
+        tensor_id: int,
+        shape: tuple[int, ...],
+        dtype: Any,
+        capacity: int,
+        offset: int = 0,
+    ):
+        self._owner = owner
+        self._id = tensor_id
+        self.shape = shape
+        self.dtype = dtype
+        self._capacity = capacity
+        self._offset = offset
+
+    def _argument(self) -> _ResidentArg:
+        return _ResidentArg(_geometry(self.shape, self.dtype, self._id), self._offset)
+
+    def view(self, shape: tuple[int, ...], offset_elements: int = 0) -> "A1DeviceTensor":
+        """Create a dense view relative to this view, without copying data."""
+        geometry = _geometry(tuple(shape), self.dtype, self._id)
+        current = self._argument().tensor
+        if isinstance(offset_elements, bool) or not isinstance(offset_elements, int) or offset_elements < 0:
+            raise ValueError("view offset must be a nonnegative integer")
+        element_bytes = 2 if geometry.dtype == 1 else 4
+        offset = offset_elements * element_bytes
+        if offset > current.bytes or geometry.bytes > current.bytes - offset:
+            raise ValueError("resident tensor view exceeds its parent view")
+        return A1DeviceTensor(self._owner, self._id, tuple(shape), self.dtype, self._capacity, self._offset + offset)
+
+    def copy_from(self, tensor: Any) -> None:
+        """Upload one matching contiguous CPU tensor into this view."""
+        self._owner._copy_tensor(self, tensor, upload=True)
+
+    def to_cpu(self) -> Any:
+        """Download this view into a newly allocated CPU tensor."""
+        import torch  # noqa: PLC0415
+
+        tensor = torch.empty(self.shape, dtype=self.dtype)
+        self._owner._copy_tensor(self, tensor, upload=False)
+        return tensor
+
+
+def _geometry(shape: tuple[int, ...], dtype: Any, address: int = 1) -> _HostTensorArg:
+    import torch  # noqa: PLC0415
+
+    if dtype not in (torch.float16, torch.float32):
+        raise ValueError("resident tensors require FP16 or FP32")
+    if not 1 <= len(shape) <= 5 or any(
+        isinstance(x, bool) or not isinstance(x, int) or not 0 < x <= 0xFFFFFFFF for x in shape
+    ):
+        raise ValueError("resident tensor shape exceeds the A1 kernel ABI")
+    elements = 1
+    for size in shape:
+        elements *= size
+    if elements > 0xFFFFFFFF:
+        raise ValueError("resident tensor element count exceeds the A1 kernel ABI")
+    return _HostTensorArg(
+        address,
+        elements * (2 if dtype == torch.float16 else 4),
+        1 if dtype == torch.float16 else 0,
+        len(shape),
+        (ctypes.c_uint32 * 5)(*shape),
     )
 
 
@@ -145,6 +253,68 @@ class A1SingleLaunch:
             if not self._handle.value:
                 raise RuntimeError("single launch session is closed")
             self._check(self._library.simpler_a1_run(self._handle, args, len(args)))
+
+    def empty(self, shape: tuple[int, ...], dtype: Any) -> A1DeviceTensor:
+        """Allocate an uninitialized dense device tensor in this session."""
+        return self._create_tensor(_geometry(tuple(shape), dtype), dtype, upload=False)
+
+    def upload(self, tensor: Any) -> A1DeviceTensor:
+        """Allocate and upload a contiguous CPU tensor once."""
+        return self._create_tensor(_tensor_arg(tensor), tensor.dtype, upload=True)
+
+    def _create_tensor(self, argument: _HostTensorArg, dtype: Any, *, upload: bool) -> A1DeviceTensor:
+        with self._lock:
+            if not self._handle.value:
+                raise RuntimeError("single launch session is closed")
+            tensor_id = ctypes.c_uint64()
+            self._check(
+                self._library.simpler_a1_tensor_create(
+                    self._handle, ctypes.byref(argument), int(upload), ctypes.byref(tensor_id)
+                )
+            )
+            return A1DeviceTensor(self, tensor_id.value, tuple(argument.shape[: argument.rank]), dtype, argument.bytes)
+
+    def _copy_tensor(self, device: A1DeviceTensor, host: Any, *, upload: bool) -> None:
+        argument = _tensor_arg(host)
+        if device._owner is not self or tuple(host.shape) != device.shape or host.dtype != device.dtype:
+            raise ValueError("resident transfer geometry or owner mismatch")
+        with self._lock:
+            if not self._handle.value:
+                raise RuntimeError("single launch session is closed")
+            resident = device._argument()
+            self._check(
+                self._library.simpler_a1_tensor_copy(
+                    self._handle, ctypes.byref(resident), ctypes.byref(argument), int(upload)
+                )
+            )
+
+    def register_kernel(self, kernel: bytes) -> int:
+        """Register another whole ELF object in the same device context."""
+        if not isinstance(kernel, bytes) or not kernel.startswith(b"\x7fELF"):
+            raise ValueError("kernel must be a CANN-loadable ELF object")
+        with self._lock:
+            if not self._handle.value:
+                raise RuntimeError("single launch session is closed")
+            image = ctypes.create_string_buffer(kernel)
+            kernel_id = ctypes.c_uint32()
+            self._check(self._library.simpler_a1_register(self._handle, image, len(kernel), ctypes.byref(kernel_id)))
+            return kernel_id.value
+
+    def run_device(self, *tensors: A1DeviceTensor, kernel_id: int = 0, blocks: int = 1) -> None:
+        """Run synchronously on resident tensors without activation transfers."""
+        if not 1 <= len(tensors) <= 64 or any(
+            not isinstance(t, A1DeviceTensor) or t._owner is not self for t in tensors
+        ):
+            raise ValueError("resident launch requires 1..64 tensors owned by this session")
+        if isinstance(kernel_id, bool) or not isinstance(kernel_id, int) or not 0 <= kernel_id <= 0xFFFFFFFF:
+            raise ValueError("kernel id must be a nonnegative uint32")
+        if isinstance(blocks, bool) or not isinstance(blocks, int) or not 1 <= blocks <= 8:
+            raise ValueError("A1 launch blocks must be in 1..8")
+        args = (_ResidentArg * len(tensors))(*(t._argument() for t in tensors))
+        with self._lock:
+            if not self._handle.value:
+                raise RuntimeError("single launch session is closed")
+            self._check(self._library.simpler_a1_run_resident(self._handle, args, len(args), kernel_id, blocks))
 
     def close(self) -> None:
         """Drain and release session resources; a failed drain remains retryable."""

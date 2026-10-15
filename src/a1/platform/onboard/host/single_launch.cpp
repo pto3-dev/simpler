@@ -73,6 +73,12 @@ private:
     aclrtContext previous_ = nullptr;
 };
 
+struct ResidentArg {
+    HostTensorArg tensor;
+    uint64_t offset;
+};
+static_assert(sizeof(ResidentArg) == 56);
+
 struct DeviceFree {
     void operator()(void *pointer) const {
         if (pointer) {
@@ -189,32 +195,7 @@ public:
                 AddressSpace::DEVICE
             );
         }
-        const uint64_t descriptor_bytes = descriptors.size() * sizeof(KernelTensor);
-        void *device_descriptors = Allocate(descriptor_bytes);
-        Check(
-            aclrtMemcpy(
-                device_descriptors, descriptor_bytes, descriptors.data(), descriptor_bytes, ACL_MEMCPY_HOST_TO_DEVICE
-            ),
-            "upload descriptors"
-        );
-        std::vector<uint64_t> slots(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            slots[i] = reinterpret_cast<uint64_t>(device_descriptors) + i * sizeof(KernelTensor);
-        }
-        const uint64_t slot_bytes = slots.size() * sizeof(uint64_t);
-        void *device_slots = Allocate(slot_bytes);
-        Check(
-            aclrtMemcpy(device_slots, slot_bytes, slots.data(), slot_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
-            "upload arguments"
-        );
-        uint64_t entry_argument = reinterpret_cast<uint64_t>(device_slots);
-        rtArgsEx_t launch_args{};
-        launch_args.args = &entry_argument;
-        launch_args.argsSize = sizeof(entry_argument);
-        rtTaskCfgInfo_t config{};
-        config.schemMode = RT_SCHEM_MODE_BATCH;
-        Check(rtKernelLaunchWithHandleV2(kernel_, 0, 1, &launch_args, nullptr, stream_, &config), "launch kernel");
-        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "synchronize kernel");
+        Launch(descriptors.data(), count, kernel_, 1);
         for (uint32_t i = 0; i < count; ++i) {
             Check(
                 aclrtMemcpy(
@@ -224,6 +205,105 @@ public:
                 "download tensor"
             );
         }
+        allocations_.clear();
+        context.Restore();
+    }
+
+    uint64_t CreateTensor(const HostTensorArg &arg, bool upload) {
+        Validate(arg);
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        ContextGuard context(context_);
+        void *pointer = nullptr;
+        Check(aclrtMalloc(&pointer, arg.bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "allocate resident tensor");
+        DeviceAllocation allocation(pointer);
+        if (upload) {
+            Check(
+                aclrtMemcpy(
+                    pointer, arg.bytes, reinterpret_cast<void *>(arg.address), arg.bytes, ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "upload resident tensor"
+            );
+        }
+        resident_.push_back({std::move(allocation), arg.bytes, arg.dtype});
+        context.Restore();
+        return resident_.size();
+    }
+
+    void CopyTensor(const ResidentArg &device, const HostTensorArg &host, bool upload) {
+        Validate(host);
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        void *pointer = ResidentPointer(device);
+        if (device.tensor.bytes != host.bytes || device.tensor.dtype != host.dtype || device.tensor.rank != host.rank ||
+            std::memcmp(device.tensor.shape, host.shape, sizeof(host.shape)) != 0) {
+            throw std::invalid_argument("resident transfer geometry mismatch");
+        }
+        ContextGuard context(context_);
+        if (upload) {
+            Check(
+                aclrtMemcpy(
+                    pointer, host.bytes, reinterpret_cast<void *>(host.address), host.bytes, ACL_MEMCPY_HOST_TO_DEVICE
+                ),
+                "upload resident tensor"
+            );
+        } else {
+            Check(
+                aclrtMemcpy(
+                    reinterpret_cast<void *>(host.address), host.bytes, pointer, host.bytes, ACL_MEMCPY_DEVICE_TO_HOST
+                ),
+                "download resident tensor"
+            );
+        }
+        context.Restore();
+    }
+
+    uint32_t RegisterKernel(const void *binary, uint64_t bytes) {
+        if (!binary || bytes < 4 || bytes > UINT32_MAX || std::memcmp(binary, "\177ELF", 4) != 0) {
+            throw std::invalid_argument("invalid A1 ELF object");
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        ContextGuard context(context_);
+        ExtraKernel extra;
+        extra.object.assign(static_cast<const char *>(binary), static_cast<const char *>(binary) + bytes);
+        rtDevBinary_t image{};
+        image.magic = RT_DEV_BINARY_MAGIC_ELF;
+        image.data = extra.object.data();
+        image.length = extra.object.size();
+        Check(rtRegisterAllKernel(&image, &extra.handle), "register resident kernel");
+        try {
+            extra_kernels_.push_back(std::move(extra));
+        } catch (...) {
+            rtDevBinaryUnRegister(extra.handle);
+            throw;
+        }
+        context.Restore();
+        return extra_kernels_.size();
+    }
+
+    void RunResident(const ResidentArg *args, uint32_t count, uint32_t kernel_id, uint32_t blocks) {
+        if (!args || count == 0 || count > 64 || blocks == 0 || blocks > 8) {
+            throw std::invalid_argument("resident launch requires 1..64 tensors and 1..8 blocks");
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        if (kernel_id > extra_kernels_.size()) {
+            throw std::invalid_argument("resident kernel id is not registered");
+        }
+        std::vector<KernelTensor> descriptors(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &arg = args[i].tensor;
+            void *pointer = ResidentPointer(args[i]);
+            descriptors[i].init_external(
+                pointer, arg.bytes, arg.shape, arg.rank, static_cast<DataType>(arg.dtype), 0, false,
+                AddressSpace::DEVICE
+            );
+        }
+        ContextGuard context(context_);
+        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "drain resident stream");
+        allocations_.clear();
+        Launch(descriptors.data(), count, kernel_id ? extra_kernels_[kernel_id - 1].handle : kernel_, blocks);
         allocations_.clear();
         context.Restore();
     }
@@ -241,6 +321,11 @@ public:
                 Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "drain stream before close");
             }
             allocations_.clear();
+            resident_.clear();
+            while (!extra_kernels_.empty()) {
+                Check(rtDevBinaryUnRegister(extra_kernels_.back().handle), "unregister resident kernel");
+                extra_kernels_.pop_back();
+            }
             if (kernel_) {
                 Check(rtDevBinaryUnRegister(kernel_), "unregister kernel");
                 kernel_ = nullptr;
@@ -264,6 +349,62 @@ public:
     }
 
 private:
+    struct ResidentBuffer {
+        DeviceAllocation allocation;
+        uint64_t bytes;
+        uint32_t dtype;
+    };
+    struct ExtraKernel {
+        std::vector<char> object;
+        void *handle = nullptr;
+    };
+    void RequireOpen() const {
+        if (!stream_ || !kernel_) {
+            throw std::runtime_error("single launch session is closed");
+        }
+    }
+    void *ResidentPointer(const ResidentArg &arg) {
+        Validate(arg.tensor);
+        const auto id = arg.tensor.address;
+        if (!id || id > resident_.size()) {
+            throw std::invalid_argument("resident tensor is not owned by this session");
+        }
+        const auto &buffer = resident_[id - 1];
+        const uint64_t element_bytes = arg.tensor.dtype == static_cast<uint32_t>(DataType::FLOAT16) ? 2 : 4;
+        if (arg.tensor.dtype != buffer.dtype || arg.offset % element_bytes || arg.tensor.bytes > buffer.bytes ||
+            arg.offset > buffer.bytes - arg.tensor.bytes) {
+            throw std::invalid_argument("resident tensor view exceeds its allocation or changes dtype");
+        }
+        return static_cast<char *>(buffer.allocation.get()) + arg.offset;
+    }
+    void Launch(const KernelTensor *descriptors, uint32_t count, void *kernel, uint32_t blocks) {
+        const uint64_t descriptor_bytes = count * sizeof(KernelTensor);
+        void *device_descriptors = Allocate(descriptor_bytes);
+        Check(
+            aclrtMemcpy(device_descriptors, descriptor_bytes, descriptors, descriptor_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+            "upload descriptors"
+        );
+        std::vector<uint64_t> slots(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            slots[i] = reinterpret_cast<uint64_t>(device_descriptors) + i * sizeof(KernelTensor);
+        }
+        const uint64_t slot_bytes = slots.size() * sizeof(uint64_t);
+        void *device_slots = Allocate(slot_bytes);
+        Check(
+            aclrtMemcpy(device_slots, slot_bytes, slots.data(), slot_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+            "upload arguments"
+        );
+        uint64_t entry_argument = reinterpret_cast<uint64_t>(device_slots);
+        rtArgsEx_t launch_args{};
+        launch_args.args = &entry_argument;
+        launch_args.argsSize = sizeof(entry_argument);
+        rtTaskCfgInfo_t config{};
+        config.schemMode = RT_SCHEM_MODE_BATCH;
+        Check(rtKernelLaunchWithHandleV2(kernel, 0, blocks, &launch_args, nullptr, stream_, &config), "launch kernel");
+        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "synchronize kernel");
+    }
+    std::vector<ResidentBuffer> resident_;
+    std::vector<ExtraKernel> extra_kernels_;
     void *Allocate(uint64_t bytes) {
         void *pointer = nullptr;
         Check(aclrtMalloc(&pointer, bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "allocate device memory");
@@ -321,5 +462,32 @@ extern "C" int simpler_a1_close(void *session) {
             runner->Close();
             delete runner;
         }
+    });
+}
+
+extern "C" int simpler_a1_tensor_create(void *session, const HostTensorArg *arg, uint32_t upload, uint64_t *id) {
+    return Invoke([&] {
+        if (!session || !arg || !id || upload > 1) throw std::invalid_argument("invalid resident tensor request");
+        *id = static_cast<SingleLaunch *>(session)->CreateTensor(*arg, upload != 0);
+    });
+}
+extern "C" int
+simpler_a1_tensor_copy(void *session, const ResidentArg *device, const HostTensorArg *host, uint32_t upload) {
+    return Invoke([&] {
+        if (!session || !device || !host || upload > 1) throw std::invalid_argument("invalid resident transfer");
+        static_cast<SingleLaunch *>(session)->CopyTensor(*device, *host, upload != 0);
+    });
+}
+extern "C" int simpler_a1_register(void *session, const void *image, uint64_t bytes, uint32_t *id) {
+    return Invoke([&] {
+        if (!session || !id) throw std::invalid_argument("invalid resident kernel request");
+        *id = static_cast<SingleLaunch *>(session)->RegisterKernel(image, bytes);
+    });
+}
+extern "C" int
+simpler_a1_run_resident(void *session, const ResidentArg *args, uint32_t count, uint32_t kernel_id, uint32_t blocks) {
+    return Invoke([&] {
+        if (!session) throw std::invalid_argument("single launch session is closed");
+        static_cast<SingleLaunch *>(session)->RunResident(args, count, kernel_id, blocks);
     });
 }
