@@ -159,13 +159,29 @@ class CCECToolchain(Toolchain):
             raise FileNotFoundError(f"ccec linker not found: {self.linker_path}")
 
     def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> list[str]:
-        # A5 uses dav-c310 architecture, A2A3 uses dav-c220
-        if self.platform in ("a5", "a5sim"):
+        if core_type not in ("aic", "aiv"):
+            raise ValueError(f"Unknown core type: {core_type!r}")
+        if self.platform == "a1":
+            arch = "dav-m200"
+        elif self.platform in ("a5", "a5sim"):
             arch = "dav-c310-vec" if core_type == "aiv" else "dav-c310-cube"
         elif self.platform in ("a2a3", "a2a3sim"):
             arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
         else:
-            raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(f"Unknown platform: {self.platform}. Supported: a1, a2a3, a2a3sim, a5, a5sim")
+
+        if self.platform == "a1":
+            return [
+                "-c",
+                "-O3",
+                "-g",
+                "-x",
+                "cce",
+                "-Wall",
+                "-std=c++17",
+                "--cce-aicore-only",
+                f"--cce-aicore-arch={arch}",
+            ]
 
         flags = [
             "-c",
