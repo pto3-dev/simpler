@@ -90,16 +90,25 @@ All SOs loaded by DeviceRunner (AICPU, AICore, kernel, orchestration) use
 SOs need from the host SO are passed via explicit function pointer injection
 (see "Function Pointer Injection" below).
 
-### Orchestration SO: `RTLD_LAZY | RTLD_LOCAL`
+### Orchestration SO
 
-Loaded by the AICPU executor at runtime from a temp file. Uses `RTLD_LAZY`
-because not all symbols may be referenced. Communicates with the runtime
-through a function pointer table (`RuntimeOps`), not direct symbol
-linkage.
+Loaded from a temp file. Which side loads it, with which flags, and which ops
+table it calls through all differ by runtime:
 
-`RuntimeOps` is a binary ABI without size or version negotiation.
+| Runtime | Loaded by | Flags | Ops table |
+| ------- | --------- | ----- | --------- |
+| `tensormap_and_ringbuffer` | the AICPU executor | `RTLD_LAZY \| RTLD_LOCAL` — not all symbols may be referenced | `RuntimeOps`, reached through `RuntimeContext` |
+| `host_build_graph` | the host | `RTLD_NOW \| RTLD_LOCAL` | `OrchOps`, reached through `OrchContext` |
+
+`host_build_graph` orchestrates on the host, so its orchestration SO never
+reaches the AICPU at all, and the context it calls through carries only host
+state — none of it travels in the image uploaded to the device. Either way the
+SO communicates with its runtime through the function pointer table, not direct
+symbol linkage.
+
+Both tables are a binary ABI without size or version negotiation.
 Orchestration SOs and their runtime must therefore be built from the same
-simpler revision. Changing the table's field count, order, or signatures
+simpler revision. Changing a table's field count, order, or signatures
 invalidates previously built orchestration SOs; cached or prebuilt artifacts
 must be rebuilt before they are loaded by the updated runtime.
 
@@ -252,7 +261,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | Host runtime | `ChipWorker::lib_handle_` | Per-init: dlopen in `init()`, dlclose in `finalize()` |
 | AICPU | `DeviceRunner::aicpu_so_handle_` | Per-init: loaded lazily by the first `prepare_execution()`, retained across runs, closed by `finalize()` |
 | AICore | `DeviceRunner::aicore_so_handle_` | Per-run: reloaded for the run's kernel binary, closed after a successful `drain_execution()` (or by final cleanup) |
-| Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `validate_runtime_impl()` |
+| Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `release_run_bindings_impl()` |
 | Orchestration | `AicpuExecutor::orch_so_handle_` | Per-run: loaded by orchestrator thread, closed by last thread in `deinit()` |
 
 ### Onboard
@@ -280,7 +289,10 @@ per callable.
 Onboard per-task launches pass the front-less `KernelArgs` payload directly to
 `rtsLaunchCpuKernel` with no CANN launch front: runtime state flows through
 `runtime_args` (at offset 0) and the other profiling/logging/register fields.
-AICore receives only a device copy of that same `KernelArgs` payload.
+AICore receives `AicoreLaunchArgs` in its own launch argument block — a
+projection of the same struct holding the subset its entry reads, the `Runtime`
+address plus the profiling flag and the addresses it gates. No device copy of
+`KernelArgs` is involved on either side.
 
 ## Execution Lifecycle
 
@@ -304,7 +316,9 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
            simpler_unregister_callable, get_pipeline_contract,
            supports_concurrent_native_prepare_ctx,
            get_arena_bank_gm_heap_base_ctx, get_retained_temp_addr_ctx,
-           finalize_device
+           finalize_device, simpler_kernel_mode_supported,
+           simpler_kernel_mode_init, simpler_kernel_mode_prepare_callable,
+           simpler_kernel_mode_launch
     create_device_context() → DeviceContextHandle
     allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size, ...)
@@ -330,7 +344,8 @@ ChipWorker.run(handle, args, config)                   # public wrapper path
     simpler_wait_run(...)
       DeviceRunner::drain_execution(active)   join threads; close AICore SO
     simpler_finalize_run(...)
-      validate_runtime_impl(r)               copy results, remove kernels
+      copy_back_run_outputs_impl(r)          copy results
+      release_run_bindings_impl(r)           release leases, remove kernels
       state->~NativeRunContext()               destroys Runtime
 
 ChipWorker.finalize()
@@ -385,12 +400,20 @@ device_worker_main(device_id)
                   ensure_binaries_loaded()     already done by init
                   launch_aicore_kernel()       cached rtRegisterAllKernel handle
                                                  + rtKernelLaunchWithHandleV2
+                                                 + record core_done on that stream
                   launch_aicpu_kernel(Run)     rtsLaunchCpuKernel, cached rtFuncHandle
+                                                 + record cpu_done on that stream
                   publish acceptance from the completed launch receipt
               simpler_poll_run(...)            nonblocking child progress query
-                DeviceRunner::poll_execution(active) nonblocking stream query
+                DeviceRunner::poll_execution(active) nonblocking query of this run's
+                                                 two completion boundaries
               simpler_wait_run(...)
-                DeviceRunner::drain_execution(active) wait on both streams
+                DeviceRunner::drain_execution(active) wait on this run's two
+                                                 boundaries, then read the
+                                                 device's verdict with a stream
+                                                 synchronize — the only call
+                                                 that produces one
+                                                 (docs/design/run-completion-fence.md)
               simpler_finalize_run(...)        rtMemcpy results back; destroy state
 
     ChipWorker.finalize()

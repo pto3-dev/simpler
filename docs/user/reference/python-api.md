@@ -4,7 +4,7 @@ The surface you write against, hand-maintained: what `**config` keys `Worker`
 accepts, `CallConfig` defaults, and the argument-order footguns a generator
 cannot state. For the complete generated listing of every public symbol and
 signature, see the API pages on the
-[documentation site](https://hw-native-sys.github.io/simpler/user/reference/api/worker/).
+[documentation site](https://www.pypto.ai/simpler/user/reference/api/worker/).
 Treat the source as authoritative when the two disagree, and fix this page in the
 same change.
 
@@ -17,7 +17,7 @@ stays cheap and does not require the `_task_interface` extension.
 from simpler import Worker, trace     # or: from simpler.worker import Worker
 from simpler.task_interface import (
     ArgDirection, CallConfig, ChipCallable, CoreCallable,
-    DataType, TaskArgs, TaskHandle, TensorArgType,
+    DataType, TaskArgs, TaskHandle, Tensor, TensorArgType,
 )
 from simpler_setup import KernelCompiler, SceneTestCase, scene_test
 ```
@@ -61,11 +61,11 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | Method | Notes |
 | ------ | ----- |
 | `malloc(size) -> Buffer` | L2 only; allocates on this worker's chip |
-| `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Allocates on an L3 worker's chip child; use `handle.tensor(shapes, dtype)` to name a task argument |
+| `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Allocates on an L3 worker's chip child; use `Tensor(handle, shapes=shapes, dtype=dtype)` to name a task argument |
 | `free(handle)` | Releases a device `Buffer` returned by either allocation method |
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
-| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `handle.tensor(shapes, dtype)` |
+| `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -82,8 +82,34 @@ cannot walk a legal-looking length past the end.
 | `submit(callable, args=None, config=None) -> RunHandle` | Non-blocking |
 | `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
 
-`RunHandle` exposes `done() -> bool`, `wait(timeout=None)`, and
+`RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.
+
+Direct L2 handles validate the execution context inside the native wait.
+`ExecutionContextRefused`, imported from `simpler.task_interface`, is a
+`RuntimeError` subclass for current-context preflight refusal. It supplies no
+completion verdict: the handle, its argument snapshot and its Buffer uses remain
+intact; restore the required context before retrying. Other native wait errors
+remain terminal and retain unproven Buffer uses; error messages do not determine
+the classification. The public Worker initialization still owns its device;
+borrowed-context initialization is an internal native entry, and this exception
+alone does not expose a public borrowed Worker.
+
+READY Worker operations validate through the shared operation lease, outside the
+lifecycle lock and before their bodies run. Direct L2 operations check the native
+current-context predicate; L3+ operations retain their own child/environment
+contracts. This covers allocation, free, copies, registration and future leased
+APIs. Only `device_location`, a source-descriptor query with no device operation,
+explicitly skips current-context validation. Close checks separately before its
+CLOSED admission fence and teardown-attempt publication. An unaccepted context
+refusal preserves READY, callable handles and source uses; restore the context
+before retrying. Once close has been accepted, a teardown failure retains CLOSED
+and its cleanup debt. Re-entering close in the required context can retry that
+debt; it does not reopen the Worker. Native registration and the legacy
+ChipWorker registry also check before their state changes. Direct native
+allocation, free, copies, device-memory queries and diagnostic flush validate
+before calling the backend; cached host counters and descriptors do not perform
+device operations.
 
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level
 callable is a **Python orchestration function** `f(orch, args, cfg)`, where
@@ -145,12 +171,28 @@ ChipCallable.build(
 
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the
-orchestration submits. `ChipCallable` exposes `binary_size`.
+orchestration submits. `ChipCallable` exposes `binary_size` and
+`scalar_count`. `scalar_count` counts the signature's `SCALAR` entries,
+including for callables loaded from cached bytes. The tensor count is
+`sig_count - scalar_count`.
 
 Public `Worker` calls use `TaskArgs` containing address-free `Tensor` views at
 every level. The L2 leaf resolves those views into the internal
 `ChipStorageTaskArgs` / `ChipTensor` representation; callers do not pass that
 internal representation to `Worker.run()`.
+
+Direct L2 `Worker` owns its native chip binding and its own callable handles.
+The lower-level public `ChipWorker` remains a separate compatibility entry;
+its handles and Python registry are not used by `Worker` internally.
+
+The lower-level `ChipWorker.run(handle, args)` accepts the same `TaskArgs` for
+scalars and contiguous HOST/H2D tensors. DEVICE Buffer arguments use
+`Worker(level=2).submit`, which supplies live-source validation. Keep host backing
+storage alive until the synchronous call returns; after a native-call error,
+keep it alive until `finalize()` succeeds. ChipWorker retains imported mappings
+and refuses further public runs until that teardown. `ChipStorageTaskArgs`
+remains accepted only as a resolved-address compatibility path. See
+[invocation binding](../../buffer-abi.md#direct-l2-invocation-binding).
 
 For L3+ graph construction, `TaskArgs.add_dep(*handles)` adds `WAIT | RETAIN`
 edges: each consumer waits for its producers and keeps their task-owned
@@ -161,13 +203,46 @@ caller.
 
 ```python
 args = TaskArgs()
-args.add_tensor(device_buffer.tensor((rows, cols), DataType.FLOAT32), TensorArgType.INPUT)
+args.add_tensor(Tensor(device_buffer, shapes=(rows, cols), dtype=DataType.FLOAT32), TensorArgType.INPUT)
 ```
 
-`device_buffer` is a `Buffer` returned by `malloc` or `alloc_child_tensor`.
+`device_buffer` is a `Buffer` returned by `malloc`, `alloc_child_tensor`, or
+`Buffer.wrap` for a local direct-L2 device source.
+`Tensor(buffer, *, shapes, dtype, strides=None, byte_offset=0)` validates a view
+without allocation or transfer. `buffer.tensor(...)` remains a compatibility
+forwarder. Views carry descriptor values; they do not own the backing allocation.
 Add tensors **in signature order**, before any scalars. Use `INPUT` for an
 input, `OUTPUT_EXISTING` for a caller-allocated output, and `INOUT` for an
 input/output view. `DataType` carries the element types.
+
+### Borrowed device storage
+
+```python
+from simpler.buffer import Buffer
+
+source = Buffer.wrap(address=ptr, nbytes=capacity, location=worker.device_location)
+args = TaskArgs()
+args.add_tensor(Tensor(source, shapes=(count,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+worker.submit(callable_handle, args).result()
+source.close()
+```
+
+`worker.device_location` is available after direct L2 initialization. The token
+identifies that native environment binding, including its process, incarnation
+and context generation; it cannot be replaced by a device ordinal or used on
+another Worker. Source checks reject a changed or successfully retired native
+binding even if the Python facade still reports READY. Reading the location
+performs no RTS call; current-context validation remains an execution precondition. `Buffer.wrap(..., access=...)` accepts
+an existing `AccessMode` grant (default `READWRITE`) and registers caller-owned
+storage without consumer attachment. Submission performs that attachment.
+
+The caller owns the allocation and guarantees its real device, capacity and
+lifetime. `source.close()` revokes an idle registration without freeing memory;
+it refuses in-flight or unproven completion. `Worker.free` and Worker copy
+operations do not manage this external allocation. Use its allocator for IO
+and physical release. HOST, remote, and borrowed RTS context attachment are
+outside this interface. See the [source lifetime contract](../../buffer-abi.md#borrowed-device-sources-at-direct-l2)
+for failure and Program Worker teardown behavior.
 
 ## `CallConfig`
 
@@ -176,12 +251,11 @@ input/output view. `DataType` carries the element types.
 | Field | Default | Meaning |
 | ----- | ------- | ------- |
 | `aicpu_thread_num` | `0` | AICPU threads for this run; `0` selects the architecture default |
-| `enable_chip_swimlane` | `0` | `0` off; `1`–`4` select detail. L2 and same-host L3; cross-rank merging requires detail level `4` |
+| `enable_chip_swimlane` | `0` | `0` off; `1`–`4` select detail. L2 and same-host L3; a lower level simply records fewer device streams, and cross-Rank merging works at any of them |
 | `enable_dump_args` | `0` | Capture per-task arguments |
 | `enable_pmu` | `0` | `0` off; `>0` selects the event type |
 | `enable_dep_gen` | `0` | Emit the dependency graph |
 | `enable_scope_stats` | `0` | Writes `<output_prefix>/scope_stats/scope_stats.jsonl` |
-| `capture_clock_anchors` | `False` | Anchors the Host and Device clocks so device timestamps land on an absolute Host timeline. Set by the ChipWorker child for an L3 chip-swimlane capture; not a caller knob |
 | `output_prefix` | `""` | **Required whenever any diagnostic is enabled** |
 | `runtime_env` | — | TRB uses `ring_task_window`, `ring_heap`, and `ring_dep_pool`. HBG uses `ring_task_window[0]` for graph task capacity; its graph heap is sized after orchestration |
 
@@ -235,3 +309,23 @@ Analysis CLIs live under `simpler_setup.tools`; see
 - [How-to: write and run a kernel](../how-to/write-and-run-a-kernel.md)
 - [Task Flow](../../task-flow.md) — how these handles travel through the runtime
 - [Communication Domains](../../comm-domain.md) — `allocate_domain` semantics
+
+### Host controls in HBG orchestration
+
+`Tensor` describes a view; transfer is chosen separately for each `TaskArgs` entry:
+
+```python
+from simpler.task_interface import TensorTransfer
+
+args.add_tensor(control, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+args.add_tensor(control, TensorArgType.INPUT, transfer=TensorTransfer.H2D)
+```
+
+With HOST backing, the first entry stays on the host for HBG `get_tensor_data`.
+The second becomes a DEVICE operand after Program copies it. Pass each entry to
+the matching consumer; host access to DEVICE and device access to HOST are errors.
+Host `set_tensor_data` requires an OUT/INOUT declaration and changes only the HOST
+binding. It does not upload that write to the separate device binding. The caller
+keeps the backing alive through completion and explicitly waits/copies any prior
+device result before submitting a host consumer. TMR device orchestration rejects
+HOST/NONE. Neither path creates a cross-side mapped view.

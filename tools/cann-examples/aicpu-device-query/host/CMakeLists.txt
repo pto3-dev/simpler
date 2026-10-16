@@ -18,15 +18,21 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../cmake/ascend_driver_path.cmake")
+simpler_require_ascend_driver_library()
+
 add_executable(query_device_hal query_device_hal.cpp)
 
 get_filename_component(SIMPLER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 set(A5_TOPOLOGY_DIR "${SIMPLER_ROOT}/src/a5/platform/onboard/host")
 target_sources(query_device_hal PRIVATE
     "${A5_TOPOLOGY_DIR}/aicpu_topology_probe.cpp"
+    "${A5_TOPOLOGY_DIR}/aicpu_affinity_select.cpp"
     "${SIMPLER_ROOT}/src/common/log/host_log.cpp"
     "${SIMPLER_ROOT}/src/common/log/unified_log_host.cpp"
 )
+include("${SIMPLER_ROOT}/cmake/aicpu_topology_driver.cmake")
+simpler_configure_aicpu_topology_driver(query_device_hal)
 add_custom_command(TARGET query_device_hal POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${A5_TOPOLOGY_DIR}/aicpu_cpu_topo_fallback.json"
@@ -47,12 +53,10 @@ target_include_directories(query_device_hal PRIVATE
     ${SIMPLER_ROOT}/src/common/log
 )
 
-set(ASCEND_DRIVER_LIB_DIR "/usr/local/Ascend/driver/lib64/driver"
-    CACHE PATH "Directory containing libascend_hal.so")
 target_link_directories(query_device_hal PRIVATE
     ${ASCEND_HOME_PATH}/lib64
     ${ASCEND_HOME_PATH}/runtime/lib64
-    ${ASCEND_DRIVER_LIB_DIR}
+    ${ASCEND_DRIVER_PATH}/lib64/driver
 )
 
 # ascendcl for aclrt*, runtime for rt*/rts* (rtAicpuKernelLaunchExWithArgs,

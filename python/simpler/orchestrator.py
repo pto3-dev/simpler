@@ -42,7 +42,7 @@ from typing import Any
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
-from .buffer import AccessMode, BackendKind, Buffer, CanonicalIdentity, wrap_fork_inherited
+from .buffer import AccessMode, BackendKind, Buffer, wrap_fork_inherited
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -348,18 +348,13 @@ class Orchestrator:
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
         # submit can commit before an exception reaches Python.
-        device_args = worker._device_identities_in_args(c_args) if worker is not None else []
+        needs_prov = worker is not None and worker._names_device_allocation(c_args)
         prov_guard: Any = contextlib.nullcontext()
-        if device_args and worker is not None:
+        if needs_prov:
             prov_guard = worker._child_prov_lock
         with prov_guard:
-            if device_args and worker is not None:
-                worker._child_prov_check_dispatch_locked(
-                    device_args,
-                    cpp_worker_id,
-                    args=c_args,
-                    api="submit_next_level",
-                )
+            if needs_prov:
+                worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
@@ -456,24 +451,18 @@ class Orchestrator:
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
-        member_checks: list[tuple[list[tuple[CanonicalIdentity, int]], int, TaskArgs]] = []
+        member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
-                device_args = worker._device_identities_in_args(c_args)
-                if device_args:
-                    member_checks.append((device_args, worker_ids[g], c_args))
+                if worker._names_device_allocation(c_args):
+                    member_checks.append((worker_ids[g], c_args))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
         with prov_guard:
-            for device_args, target_worker_id, c_args in member_checks:
+            for target_worker_id, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(
-                    device_args,
-                    target_worker_id,
-                    args=c_args,
-                    api="submit_next_level_group",
-                )
+                worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
@@ -668,24 +657,21 @@ class Orchestrator:
         with self._control_admission("create_worker_chip_region"):
             return self._worker._create_worker_chip_region(int(worker_id), int(payload_bytes), int(counter_bytes))
 
-    def create_worker_chip_queue(self, *, worker_id: int, depth: int, input_arena_bytes: int, output_arena_bytes: int):
-        """Create an L3-L2 message queue backed by one L3-L2 communication region."""
+    def create_worker_chip_queue(
+        self, *, worker_id: object, depth: object, input_arena_bytes: object, output_arena_bytes: object
+    ):
+        """Create an L3-L2 message queue on one NEXT_LEVEL chip worker."""
         if self._worker is None:
             raise RuntimeError("create_worker_chip_queue requires an Orchestrator bound to a Worker")
         from .worker_chip_message_queue import create_worker_chip_queue  # noqa: PLC0415
 
-        # Reserved across the whole build, not just the region creation it
-        # nests: the descriptor writes that follow are device effects too. The
-        # reservation is re-entrant, so the inner create_worker_chip_region joins this
-        # one rather than deadlocking on it.
-        with self._control_admission("create_worker_chip_queue"):
-            return create_worker_chip_queue(
-                self,
-                worker_id=int(worker_id),
-                depth=int(depth),
-                input_arena_bytes=int(input_arena_bytes),
-                output_arena_bytes=int(output_arena_bytes),
-            )
+        return create_worker_chip_queue(
+            self,
+            worker_id=worker_id,
+            depth=depth,
+            input_arena_bytes=input_arena_bytes,
+            output_arena_bytes=output_arena_bytes,
+        )
 
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)
@@ -750,6 +736,26 @@ class Orchestrator:
         with self._control_admission("committed_device_memory"):
             return int(self._o.committed_device_memory(int(worker_id)))
 
+    def flush_diagnostics(self, worker_id: int, timeout_s: float) -> tuple[int, int, int, int]:
+        """Publish every diagnostic run next-level worker *worker_id* has closed.
+
+        The barrier behind `Worker.flush_diagnostics()` and `Worker.close()`:
+        with cross-run collection on, a run returning no longer means its
+        diagnostic file exists, and this is what says the files up to now do.
+        Raises when a promised file is missing.
+
+        `timeout_s` follows the native protocol unchanged — a negative value
+        means no deadline, and a zero budget on a caller that had one is
+        refused rather than turned into an unbounded wait
+        (`LocalMailboxEndpoint::control_dfx_flush`). Returns that call's
+        `(session_id, watermark_epoch, published, failed)`.
+
+        Travels the same chip control channel as every other command here, so
+        it takes the same admission.
+        """
+        with self._control_admission("flush_diagnostics"):
+            return self._o.flush_diagnostics(int(worker_id), float(timeout_s))
+
     def device_memory_info(self, worker_id: int) -> DeviceMemoryInfo:
         """Device-wide ACL_HBM_MEM free/total byte snapshot for *worker_id*."""
         with self._control_admission("device_memory_info"):
@@ -806,12 +812,7 @@ class Orchestrator:
         nbytes = get_element_size(dtype)
         for s in shape_t:
             nbytes *= s
-        oid, buffer_id, path = (
-            self._worker._owner_instance_id,
-            self._worker._next_buffer_id(),
-            f"L{self._worker.level}",
-        )
-        identity = CanonicalIdentity(oid, buffer_id)
+        identity = self._worker._burn_buffer_identity()
         # alloc keys the synthetic producer slot by the ref's canonical identity (not a raw VA), so a
         # consumer named via handle.tensor(...) dependency-wires to it. Same managed backing as
         # worker.alloc_shared_tensor; additionally registered as an L3-L2 orch-comm host buffer.
@@ -819,9 +820,10 @@ class Orchestrator:
         handle = wrap_fork_inherited(
             va,
             int(nbytes),
-            oid,
-            buffer_id,
-            path,
+            bytes(identity.owner_instance_id),
+            int(identity.buffer_id),
+            f"L{self._worker.level}",
+            generation=int(identity.generation),
             access=AccessMode.READWRITE,
             backend_kind=BackendKind.FORK_SHM,
         )

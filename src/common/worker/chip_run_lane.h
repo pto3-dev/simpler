@@ -13,11 +13,12 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <memory>
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 
 class ChipWorker;
 struct ChipRunLaneState;
@@ -66,17 +67,39 @@ public:
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
-        bool activated = true
+        bool activated = true, NativeRunProvenance provenance = {}
     );
+    // A non-null caller stream requires actual enqueue before a successful
+    // return. Stream work appended after that return is ordered after both kernels.
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
     );
 
     void drain();
+
+    /**
+     * Stop admitting runs, and finish every run that has not yet launched
+     * without launching it.
+     *
+     * For a caller that has established nothing further may reach the device —
+     * unknown device-resource ownership, say. The ordinary `close` cannot serve
+     * that: it drains, and a drain launches before it waits, so an activated
+     * prepared successor would be put on the device on the way out. Runs
+     * already launched keep their own outcomes and their own drains, which is
+     * what retires the device work, events and resources they own.
+     *
+     * Idempotent, and non-throwing: a failure finishing an unlaunched run
+     * poisons the lane so `close` reports it, rather than unwinding a caller
+     * that is already on a failure path.
+     */
+    void stop_admission() noexcept;
+
     void close();
     bool poisoned() const;
 
 private:
+    friend class ChipWorker;
+    void detach_after_failed_teardown(std::exception_ptr error) noexcept;
     std::shared_ptr<ChipRunLaneState> state_;
 };

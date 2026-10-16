@@ -80,11 +80,10 @@ SchedulerLayout SchedulerState::reserve_layout(DeviceArena &arena) {
         layout.capacities.ready_sync[i] = READY_QUEUE_CAPACITY_LIMIT;
     }
     layout.capacities.dummy = READY_QUEUE_CAPACITY_LIMIT;
-    layout.capacities.graph_ready = READY_QUEUE_CAPACITY_LIMIT;
     layout.capacities.graph_prepare = READY_QUEUE_CAPACITY_LIMIT;
 
     // Fixed-capacity early-dispatch queues first, then the configurable queues.
-    // The big nine are the arena's last reservations so that the bytes bind
+    // The big eight are the arena's last reservations so that the bytes bind
     // uploads stay one contiguous range no matter how much of them is in use.
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
@@ -98,7 +97,6 @@ SchedulerLayout SchedulerState::reserve_layout(DeviceArena &arena) {
         layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
     }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
-    layout.off_graph_ready_queue_slots = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
     layout.off_graph_prepare_queue_slots = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
     // Polling: no dep_pool arena region — producer dependencies are inline ids on
     // the payload and readiness is via the task_states array.
@@ -124,7 +122,6 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
         ready_queue_init_data_from_layout(&sched->ready_sync_queues[i], layout.capacities.ready_sync[i]);
     }
     ready_queue_init_data_from_layout(&sched->dummy_ready_queue, layout.capacities.dummy);
-    ready_queue_init_data_from_layout(&sched->graph_ready_queue, layout.capacities.graph_ready);
     ready_queue_init_data_from_layout(&sched->graph_prepare_queue, layout.capacities.graph_prepare);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_init_data_from_layout(&sched->early_dispatch_queues[i], CHIP_EARLY_DISPATCH_QUEUE_SIZE);
@@ -157,7 +154,6 @@ void SchedulerState::seed_queue_slots() {
         sched->ready_sync_queues[i].seed_slots();
     }
     sched->dummy_ready_queue.seed_slots();
-    sched->graph_ready_queue.seed_slots();
     sched->graph_prepare_queue.seed_slots();
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         sched->early_dispatch_queues[i].seed_slots();
@@ -175,7 +171,6 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
         ready_queue_wire_arena_pointers(&sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i]);
     }
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
-    ready_queue_wire_arena_pointers(&sched->graph_ready_queue, arena, layout.off_graph_ready_queue_slots);
     ready_queue_wire_arena_pointers(&sched->graph_prepare_queue, arena, layout.off_graph_prepare_queue_slots);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(
@@ -196,7 +191,6 @@ void SchedulerState::destroy() {
         ready_queue_destroy(&sched->ready_sync_queues[i]);
     }
     ready_queue_destroy(&sched->dummy_ready_queue);
-    ready_queue_destroy(&sched->graph_ready_queue);
     ready_queue_destroy(&sched->graph_prepare_queue);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->early_dispatch_queues[i]);
@@ -240,11 +234,10 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
  * Populate the prebuilt runtime-arena image in place (host build path).
  *
  * Zeroes the RuntimeContext header at layout.off_runtime and initializes the
- * scheduler (ready / sync / dummy / graph queues) against the device SM.
- * rt->orchestrator is left null: the
- * orchestrator is a host-owned object the host-orch path
- * (run_host_orchestration) stands up against the host SM once that buffer
- * exists, and it is never uploaded to the device. Caller must follow up with
+ * scheduler (ready / sync / dummy / graph queues) against the device SM. The
+ * orchestrator is a host-owned object that the host-orch path
+ * (run_host_orchestration) stands up against the host SM on its own OrchContext,
+ * so no field here names it. Caller must follow up with
  * runtime_wire_arena_pointers. Returns the arena-resident RuntimeContext*, or
  * nullptr on failure.
  */
@@ -254,21 +247,15 @@ RuntimeContext *runtime_init_data_from_layout(
     RuntimeContext *rt = static_cast<RuntimeContext *>(arena.region_ptr(layout.off_runtime));
     memset(rt, 0, sizeof(*rt));
 
-    // rt->ops is filled by the AICPU at boot.
+    // The ops table and the orchestrator are not here at all: they live on the
+    // host-side OrchContext, so nothing host-only travels in this image.
     rt->mode = mode;
     rt->total_cycles = 0;
-    rt->active_callable_hash = 0;
 
-    // Two components are deliberately not initialized here.
-    //
-    // The orchestrator is not in this arena at all: it is a host-owned object the
-    // host-orch path (run_host_orchestration) stands up against the host SM once
-    // that buffer is allocated, and rt->orchestrator only points at it for the
-    // duration of that pass.
-    //
-    // The scheduler and sm_handle live in the device-only zone, so their bytes
-    // never travel; the AICPU initializes them at boot. Writing them here would
-    // be writing an initialization pattern that nothing reads.
+    // The scheduler and sm_handle are deliberately left alone: they live in the
+    // device-only zone, so their bytes never travel; the AICPU initializes them at
+    // boot. Writing them here would be writing an initialization pattern that
+    // nothing reads.
     (void)sm_dev_base;
 
     return rt;

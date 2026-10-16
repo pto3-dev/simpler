@@ -32,7 +32,7 @@ shared object, opens it with `dlopen(RTLD_LOCAL)`, and resolves:
 
 - `aicpu_orchestration_config`;
 - `aicpu_orchestration_entry`; and
-- `framework_bind_runtime`.
+- `framework_bind_orch_context`.
 
 The resolved handle and entry points belong to the registered callable and stay
 alive across prepared runs. Unregister/context teardown closes the handle and
@@ -49,12 +49,105 @@ For each run, the host:
 2. reserves one backing arena for runtime/shared-memory subregions;
 3. binds the runtime to the orchestration DSO;
 4. calls the orchestration entry synchronously;
-5. finalizes task counts and the graph image; and
-6. copies the shared-memory image and the arena's copied zone to the device.
+5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
+6. returns from bind, then synchronously publishes Definitions, any resident
+   scheduler state, and finally the shared-memory image with the copied zone.
+
+The exclusive pipeline slot retains only `OrchestrationScratch`: TensorMap
+arrays and the fan-in epoch array. Each bind owns a fresh `OrchestratorState`,
+borrows those arrays, and returns them after Graph recorder teardown on every
+exit. Fatal state, counters, mirror/heap pointers and Graph bindings belong to
+that run. A bind also holds a local owning reference. `ChipWorker::finalize()`
+drains native runs, finalizes and destroys the runner, and only then closes
+`host_runtime.so`, which owns the scratch deleter and shared-pointer control-block
+code. A failed device finalization retains both the runner and module for retry.
+Callable and executor libraries closed inside runner finalization are separate
+modules. `HostApiOps` is host-only: all providers and consumers must use the same
+table definition and be built together. Null fallback covers omitted callbacks
+in that definition, not shorter tables from older binaries.
+
+TensorMap resets bucket heads, every retained task head and allocation cursors without
+reconstructing unused entries. Bucket and entry-pool storage is reused while
+its own size matches; task-head and fan-in storage grow only. Changing the
+active task capacity does not reconstruct the unchanged entry pool. A failed
+TensorMap resize preserves the prior layout and contents; a successful init
+empties the map. With default capacities the arrays retain approximately
+8.72 MiB per used slot until finalization. Pool-size changes can temporarily
+hold old and replacement arrays. No new lock or device allocation is involved.
+
+Ready-queue populations are accumulated when a task slot receives its final
+classification. Ordinary tasks, hidden allocation tasks and outer Graph tasks
+participate; Graph definition populations are still combined at bind. Output
+layout entries are initialized and read only at `OUTPUT` argument positions.
+
+`publish_run_image_impl` is the single metadata consumer. Definition and compact
+image sources are retained by the exclusive pipeline slot; A5 scheduler source
+storage moves into the same pending record. Device allocations keep their
+existing owners. No rebind/growth may replace borrowed staging before the copy
+returns. Consuming the record also consumes it on failure: later regions are not
+written, launch is forbidden, and failed-prepare cleanup retires run-owned
+allocations. Abandoning a bind clears its sources without performing metadata
+copies. Tensor copy-in and host get/set remain preparation effects; failed
+publication cannot undo them.
+
+One owner-checked host phase trace covers bind and publication. GraphUpload and
+ArenaH2d measure their actual successful copies and preserve byte-count details;
+packing is preparation work. A completed run's release cannot close a successor's
+trace. Publication is synchronous; these lifetimes do not cover asynchronous DMA
+or captured graphs.
 
 An orchestration fatal stops this sequence before the upload. The orchestrator
 runs on the host, so its code is latched in `OrchestratorState::fatal_code` and
 never reaches shared memory; the bind maps it onto the status the caller sees.
+
+Step 1 gives each caller tensor a slice of the runner's retained temporary buffer
+rather than a per-run `device_malloc` / `device_free` pair: bind packs the run's
+HOST/H2D tensors to a 1024-aligned required size, grows the buffer only when a
+run needs more than is currently retained, and bump-slices each tensor from it,
+so a steady-state workload performs no temporary device allocation at all. The
+slices are recorded as `BufferNoop` leases — validate copies the written ones
+back and releases none, and the buffer itself is freed once at Worker finalize.
+The buffer is per pipeline slot; a run holds its slot from bind through validate
+and a concurrent reservation is admitted only on a distinct slot, so no other
+run can re-slice a buffer whose slices are still live. The mechanism
+(`RetainedTempBump`, `src/common/utils/retained_temp_bump.h`) is shared with
+`tensormap_and_ringbuffer`; that runtime's `RUNTIME_LOGIC.md` §2.4 carries the
+grow/slice details.
+
+HOST/NONE arguments bypass the temporary buffer. They remain HOST views for
+host orchestration's `get_tensor_data` (IN/INOUT) and `set_tensor_data`
+(OUT/INOUT). HOST/H2D arguments become DEVICE views after binding and cannot be
+accessed through those host entries. DEVICE task and Graph boundary arguments
+must be DEVICE. When both sides need the same control data, the caller passes
+separate HOST/NONE and HOST/H2D (or DEVICE/NONE) arguments; host writes do not
+mirror into the device argument. Device-produced host controls require an
+explicit completed copy before submitting the dependent call.
+
+An empty caller tensor addresses nothing, so it takes no slice and reaches
+orchestration with a null address. **This is a change in what hbg accepts.**
+Before the retained temporary buffer, a zero-byte non-child tensor that was not a pure
+`OUT` failed the bind: it was handed to `HostTensorAccessor::add`, which rejects
+an empty region, and the bind reported `no host view for tensor N`. It is now
+passed through, which is what `tensormap_and_ringbuffer` has always done.
+
+A pure `OUT` tensor gets a slice but is never copied in, and nothing
+zero-fills it, so the bytes a kernel does not write are whatever the slice last
+held. That was already true of a fresh `device_malloc` — the allocator pools and
+reuses device memory — but the residue is no longer always arbitrary. **On a run
+that reuses the retained buffer unchanged, it is whatever the previous tensor
+occupying that byte range left there.** The slot is keyed by pipeline slot
+alone, not by callable or by tensor identity, so that is the same tensor's own
+bytes only when the same callable runs consecutively with the same argument
+layout; a slot alternating between callables leaves another callable's bytes.
+A run that allocated or grew the buffer gets uninitialized allocator memory as
+before, and so does the first run of any Worker, because
+`RetainedTempBump::begin()` neither preserves nor initializes a buffer it
+replaces. So a kernel that writes only part of its output fails
+deterministically across the steady-state rounds of a fixed-shape workload —
+where a golden check is least likely to catch it — and randomly everywhere
+else. `device_memset` exists for zero-filling pure outputs;
+neither runtime uses it, because it would cost a device operation per output per
+run.
 
 ### 2.3 Device Execution and Teardown
 
@@ -116,12 +209,12 @@ a boundary from which region happens to be reserved first —
 orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
 table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
 therefore a plain host object that owns those arrays — `OrchestratorState::init`
-allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
-before the copied zone is uploaded, so no host address crosses the boundary. A
-`static_assert` keeps `RuntimeContext` trivially copyable, which is what forbids
-putting an owning member back inside it. The one orchestrator value the device-side
-scheduler reads, the count of tasks completed inline during orchestration, is a
-scalar `rt_orchestration_done` publishes into the runtime header.
+allocates them — and the host-side `OrchContext` is what reaches it, through a
+pointer `RuntimeContext` does not carry, so no host address can cross the boundary
+in the first place. A `static_assert` keeps `RuntimeContext` trivially copyable,
+which is what forbids putting an owning member back inside it. The one orchestrator
+value the device-side scheduler reads, the count of tasks completed inline during
+orchestration, is a scalar `rt_orchestration_done` publishes into the runtime header.
 
 **Why the scheduler state is device-written.** `SchedulerState` holds no
 per-run content: `sm_header` and the task-header pointer derive from a pooled SM base,
@@ -150,7 +243,7 @@ signal, so such a queue accepts one push and then reports full. The ramp is
 mandatory but it is a function of `capacity` alone, so
 `SchedulerState::seed_queue_slots()` writes it on the device rather than `bind`
 shipping 1,775,616 bytes of it. The ready queues are still *not* bounded to
-`total_tasks`: graph execution expands a GRAPH task into on-device in-graph tasks that
+`total_tasks`: graph execution expands a GRAPH task into on-device sub-tasks that
 push past the host task count, so every slot must carry a valid sequence.
 
 Both run before the boot thread publishes `runtime_init_ready_`, which is what

@@ -1,0 +1,176 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Compile a verified declarative Qwen HBG callable with the selected runtime."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+from build_hbg_artifact import _validate_param_names, verify_hbg_artifact
+
+
+@dataclass
+class DecodeArtifact:
+    root: Path
+    parameter_names: tuple[str, ...]
+    callable_spec: dict[str, Any]
+    source_hashes: dict[str, str]
+    source_paths: dict[str, Path]
+    runtime_config: dict[str, Any]
+
+    def compile(self, *, seed_outputs=()):
+        """Recompile generated sources using current runtime headers and tools."""
+        from simpler_setup.scene_test import compile_chip_callable_spec, l3_compile_cache_key  # noqa: PLC0415
+
+        for filename, digest in self.source_hashes.items():
+            if _sha256(self.source_paths[filename]) != digest:
+                raise ValueError(f"artifact source changed after inspection: {filename}")
+        identity = hashlib.sha256(json.dumps(self.source_hashes, sort_keys=True).encode()).hexdigest()
+        spec = self.callable_spec
+        if seed_outputs:
+            from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+            signature = list(spec["orchestration"]["signature"])
+            if len(signature) != len(self.parameter_names):
+                raise ValueError("seeded outputs require matching host and child tensor counts")
+            for name in seed_outputs:
+                index = self.parameter_names.index(name)
+                if index >= len(signature) or signature[index] != ArgDirection.OUT:
+                    raise ValueError(f"seeded output {name} must have an OUT declaration")
+                signature[index] = ArgDirection.INOUT
+            spec = {**spec, "orchestration": {**spec["orchestration"], "signature": signature}}
+            identity = hashlib.sha256(json.dumps([identity, list(seed_outputs)]).encode()).hexdigest()
+        key = l3_compile_cache_key("qwen_hbg_artifact", identity, "decode_fwd", "a2a3", "host_build_graph")
+        return compile_chip_callable_spec(spec, "a2a3", "host_build_graph", key)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _decode_callable_value(value: Any) -> Any:
+    if isinstance(value, dict) and value.get("__type__") == "ArgDirection":
+        from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+        try:
+            return ArgDirection[value["name"]]
+        except (KeyError, TypeError) as error:
+            raise ValueError("invalid callable tensor direction") from error
+    if isinstance(value, dict):
+        return {key: _decode_callable_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_callable_value(item) for item in value]
+    return value
+
+
+def _source_path(value: str, root: Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        raise ValueError("callable source paths must be relative to the artifact")
+    path = root / path
+    path = path.resolve(strict=True)
+    if not path.is_relative_to(root):
+        raise ValueError("callable source escapes artifact root")
+    if not path.is_file():
+        raise ValueError(f"expected callable source file: {path.name}")
+    return path
+
+
+def inspect_artifact(root: Path) -> DecodeArtifact:
+    """Validate frozen binaries and preserve the generated child configuration.
+
+    Binary checksums establish artifact identity, not current-runtime ABI
+    compatibility. Compilation consumes generated sources rather than loading
+    a historical orchestration shared library into the current process.
+    """
+    root = root.resolve(strict=True)
+    manifest = verify_hbg_artifact(root)
+    if manifest.get("platform") != "a2a3":
+        raise ValueError("Qwen bridge requires an a2a3 artifact")
+    metadata_path = root / "distributed_meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("platform") != "a2a3":
+        raise ValueError("distributed metadata platform must be a2a3")
+    if metadata.get("distributed_config", {}).get("runtime") != "host_build_graph":
+        raise ValueError("distributed metadata runtime must be host_build_graph")
+    names = [parameter["name"].split("__ssa_", 1)[0] for parameter in metadata["params"]]
+    _validate_param_names(names)
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate normalized distributed parameter name")
+    if manifest.get("external_argument_count") != len(names):
+        raise ValueError("manifest and distributed argument count differ")
+
+    child = root / "next_levels" / "decode_fwd"
+    spec_path = root / "callable_spec.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    if spec.get("schema") != "simpler-qwen-callable-spec-v1":
+        raise ValueError("unsupported Qwen callable spec")
+    config = cast(dict[str, Any], _decode_callable_value(spec))
+    if config.get("runtime_config", {}).get("runtime") != "host_build_graph":
+        raise ValueError("chip runtime must be host_build_graph")
+    orchestration = config["orchestration"]
+    orchestration_source = _source_path(orchestration["source"], root)
+    if orchestration_source != (child / "orchestration" / "decode_fwd.cpp").resolve():
+        raise ValueError("chip orchestration differs from the verified source")
+    if not orchestration.get("function_name"):
+        raise ValueError("missing orchestration entry symbol")
+    orchestration["source"] = str(orchestration_source)
+    kernels = config["incores"]
+    if len(kernels) != len(manifest["source_incore_bins"]):
+        raise ValueError("kernel configuration and verified binary counts differ")
+    paths = {
+        "hbg_artifact_manifest.json": root / "hbg_artifact_manifest.json",
+        "distributed_meta.json": metadata_path,
+        "callable_spec.json": spec_path,
+        "next_levels/decode_fwd/orchestration/decode_fwd.cpp": orchestration_source,
+    }
+    hashes = {name: _sha256(path) for name, path in paths.items()}
+    identifiers = set()
+    for kernel in kernels:
+        identifier = kernel["func_id"]
+        if type(identifier) is not int or identifier < 0 or identifier in identifiers:
+            raise ValueError("kernel function IDs must be unique non-negative integers")
+        identifiers.add(identifier)
+        if not any(
+            name == f"incore_{identifier}.bin" or name.startswith(f"incore_{identifier}_")
+            for name in manifest["source_incore_bins"]
+        ):
+            raise ValueError("kernel function ID has no verified in-core binary")
+        if kernel.get("core_type") not in ("aic", "aiv"):
+            raise ValueError("unsupported kernel core type")
+        source = _source_path(kernel["source"], root)
+        kernel["source"] = str(source)
+        name = str(source.relative_to(root)).replace("\\", "/")
+        paths[name] = source
+        hashes[name] = _sha256(source)
+    _validate_signatures(orchestration, kernels)
+
+    return DecodeArtifact(
+        root,
+        tuple(names),
+        {"name": "decode_fwd", "orchestration": orchestration, "incores": kernels},
+        hashes,
+        paths,
+        config["runtime_config"],
+    )
+
+
+def _validate_signatures(orchestration, kernels):
+    from simpler.task_interface import ArgDirection  # noqa: PLC0415
+
+    for entry in (orchestration, *kernels):
+        signature = entry.get("signature")
+        if not isinstance(signature, list) or (entry is orchestration and not signature):
+            raise ValueError("explicit tensor directions are required for every callable")
+        if any(direction not in (ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT) for direction in signature):
+            raise ValueError("invalid tensor direction")

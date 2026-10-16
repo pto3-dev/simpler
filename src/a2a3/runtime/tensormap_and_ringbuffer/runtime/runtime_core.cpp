@@ -29,6 +29,7 @@
 #include "aicpu/device_time.h"
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (data-wait deadline)
 #include "common/unified_log.h"
+#include "spin_hint.h"  // PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS (platform-variant data-wait budget)
 #include "tensormap_and_ringbuffer/task_id.h"
 #if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
@@ -39,11 +40,8 @@
 // Hidden visibility prevents HOST .so from polluting global symbol table.
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 
-// Derived here, not in runtime_types.h: that header is included by orchestrations
-// that define PLATFORM_PROF_SYS_CNT_FREQ locally, so pulling the platform header into
-// it caused a redefinition conflict (#1189). Scaling MS by the counter frequency (like
-// SCHEDULER_TIMEOUT_CYCLES) keeps the data-wait wall-clock identical across arches.
-static constexpr uint64_t TENSOR_DATA_TIMEOUT_CYCLES = (TENSOR_DATA_TIMEOUT_MS * PLATFORM_PROF_SYS_CNT_FREQ) / 1000;
+static constexpr uint64_t TENSOR_DATA_TIMEOUT_CYCLES =
+    static_cast<uint64_t>(PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
 
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
@@ -115,7 +113,7 @@ static bool wait_for_tensor_ready(
 
     auto wait_one_producer = [&](const ChipTaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
-        int32_t local_id = static_cast<int32_t>(slot.task->task_id.local_id());
+        int32_t local_id = slot.task->task_id.local_id();
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
         while (slot.task_state.load(std::memory_order_acquire) < CHIP_TASK_COMPLETED) {
@@ -129,8 +127,11 @@ static bool wait_for_tensor_ready(
                 if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed "
+                        "[owner_task=0x%llx task_state=%d]",
+                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id,
+                        (unsigned long long)TaskId::to_uint64(owner),
+                        (int)slot.task_state.load(std::memory_order_relaxed)
                     );
                     failed = true;
                     return;
@@ -154,10 +155,14 @@ static bool wait_for_tensor_ready(
                     return;
                 }
                 if (get_sys_cnt_aicpu() - t0 > TENSOR_DATA_TIMEOUT_CYCLES) {
+                    uint32_t refcount = slot.fanout_refcount.load(std::memory_order_acquire) & ~FANOUT_SCOPE_BIT;
+                    uint32_t needed = slot.fanout_count & ~FANOUT_SCOPE_BIT;
                     orch.report_fatal(
                         SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done "
+                        "[owner_task=0x%llx fanout=%u/%u]",
+                        (unsigned long long)TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id,
+                        (unsigned long long)TaskId::to_uint64(owner), refcount, needed
                     );
                     failed = true;
                     return;
@@ -214,6 +219,12 @@ MAYBE_UNINITIALIZED_END
 
 uint64_t
 get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    if (tensor.address_space != AddressSpace::DEVICE) {
+        rt->orchestrator.report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "device orchestration cannot access HOST tensors"
+        );
+        return 0;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
@@ -237,6 +248,12 @@ get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t
 void set_tensor_data(
     RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
+    if (tensor.address_space != AddressSpace::DEVICE) {
+        rt->orchestrator.report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "device orchestration cannot access HOST tensors"
+        );
+        return;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "

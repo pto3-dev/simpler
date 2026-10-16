@@ -64,7 +64,7 @@ jobs:
       - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
-          build-packages: "scikit-build-core nanobind<3 cmake>=3.15"
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a2a3 .[test]"
           install-torch: "false"
           system-site-packages: "true"
@@ -81,7 +81,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
-            --platform a2a3 --exclude-level 4 --require-pto-isa --compile-workers 8 -q \
+            --platform a2a3 --exclude-level 4 --require-pto-isa --compile-workers 32 -q \
             --manual "$MANUAL_MODE"
 
       - name: Compile Qwen standalone kernels (a2a3)
@@ -90,24 +90,45 @@ jobs:
           TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          for family in tensormap_and_ringbuffer host_build_graph; do
-            .venv/bin/python "examples/a2a3/$family/qwen3_14b_decode/main.py" \
-              --platform a2a3 --compile-only --compile-workers 8
+          # discover_runtimes is the one definition of what a runtime is — a
+          # directory under src/<arch>/runtime with a build_config.py — so a new
+          # one is compiled here without editing this list into existence. An
+          # empty result would make the loop body run zero times and the step
+          # pass having compiled nothing, which `set -e` does not catch in a
+          # `for` list, so it is rejected before the loop.
+          runtimes=$(.venv/bin/python -c \
+              "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('a2a3')))")
+          test -n "$runtimes"
+          for runtime in $runtimes; do
+            .venv/bin/python "examples/a2a3/$runtime/qwen3_14b_decode/main.py" \
+              --platform a2a3 --compile-only --compile-workers 32
           done
 
+      # Three selections over one corpus, disjoint and exhaustive: a test with
+      # neither marker lands here, `sdma` alone in the demo task, and
+      # `sdma_fault` in the isolated one whether or not it also carries `sdma`.
+      # Each names `examples tests/st`, so a case cannot fall between them by
+      # living under a path one of them does not walk.
       - name: Run pytest scene tests (a2a3)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
 
       - name: SDMA pytest (a2a3)
         if: inputs.manual_mode != 'only'
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          SDMA_TESTS="examples tests/st -m sdma"
+          SDMA_TESTS="examples tests/st -m 'sdma and not sdma_fault'"
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
             --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+
+      - name: SDMA fault recovery pytest (a2a3)
+        if: inputs.manual_mode != 'only'
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
+            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
 
       - name: DFX smokes (a2a3)
         if: inputs.include_dfx_smokes

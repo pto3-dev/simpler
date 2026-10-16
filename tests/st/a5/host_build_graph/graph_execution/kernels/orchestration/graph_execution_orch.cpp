@@ -21,13 +21,31 @@
 
 namespace {
 
-void layer(const GraphTaskArgs &args, int variant) {
+// Which kernel the second task runs. A construction parameter rather than a boundary
+// scalar: the recorded Definition hard-codes the choice, so two variants are two Graphs.
+struct LayerConfig : simpler::hbg::ConfigBase {
+    explicit LayerConfig(int v) :
+        variant(v) {}
+
+    int variant;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(variant); }
+    bool operator==(const LayerConfig &other) const { return variant == other.variant; }
+};
+
+void layer(const GraphTaskArgs &args, const LayerConfig &config) {
     const simpler::hbg::Tensor &a = args.tensor(0).ref();
     const simpler::hbg::Tensor &b = args.tensor(1).ref();
     const simpler::hbg::Tensor &output = args.tensor(2).ref();
 
     const std::array<uint32_t, 1> shape{a.shapes[0]};
     TensorCreateInfo intermediate(shape.data(), static_cast<uint32_t>(shape.size()), DataType::FLOAT32);
+
+    // A dependency-only root. Its shape is DUMMY, which indexes no per-shape
+    // dispatch queue, so it must never be staged by the shell's early release —
+    // this body is where that is exercised on device.
+    CoreTaskArgs dummy_root_args;
+    rt_submit_dummy_task(dummy_root_args);
 
     CoreTaskArgs add_args;
     add_args.add_input(a, b);
@@ -44,7 +62,7 @@ void layer(const GraphTaskArgs &args, int variant) {
     CoreTaskArgs left_args;
     left_args.add_input(sum);
     left_args.add_output(intermediate);
-    if (variant == 0) {
+    if (config.variant == 0) {
         left_args.add_scalar(args.scalar(0));
     } else {
         left_args.add_scalar(100.0F);
@@ -56,7 +74,12 @@ void layer(const GraphTaskArgs &args, int variant) {
     CoreTaskArgs right_args;
     right_args.add_input(sum);
     right_args.add_output(intermediate);
-    right_args.add_scalar(args.scalar(variant == 0 ? 1 : 0));
+    right_args.add_scalar(args.scalar(config.variant == 0 ? 1 : 0));
+    // Flagged alongside left so mul qualifies as an early-dispatch candidate on
+    // both its producers, which is what puts a sorted multi-entry fanin row and
+    // a pair of tracked producers on the device path. left and right are not
+    // themselves candidates: the fence dummy is an unflagged producer of both.
+    right_args.set_allow_early_resolve(true);
     TaskOutputTensors right_outputs = rt_submit_aiv_task(FUNC_ADD_SCALAR, right_args);
     simpler::hbg::Tensor right = right_outputs.get_ref(0);
 
@@ -66,7 +89,7 @@ void layer(const GraphTaskArgs &args, int variant) {
     rt_submit_aiv_task(FUNC_MUL, mul_args);
 }
 
-void submit_layer(const GraphTaskArgs &args, int variant) { rt_submit_graph(&layer, args, variant); }
+void submit_layer(const GraphTaskArgs &args, int variant) { rt_submit_graph(&layer, args, LayerConfig{variant}); }
 
 }  // namespace
 
@@ -89,6 +112,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     seed_args.add_input(a);
     seed_args.add_output(seeded_input_info);
     seed_args.add_scalar(0.0F);
+    // Flagged so the Graph shells that consume its output qualify as
+    // early-dispatch candidates: a shell's release materializes its body ahead
+    // of this task's completion, which is the ordinary-task-to-Graph edge.
+    seed_args.set_allow_early_resolve(true);
     TaskOutputTensors seed_outputs = rt_submit_aiv_task(FUNC_ADD_SCALAR, seed_args);
     simpler::hbg::Tensor seeded_a = seed_outputs.get_ref(0);
 

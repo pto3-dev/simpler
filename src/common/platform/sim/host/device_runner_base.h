@@ -43,22 +43,31 @@
 
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
+#include "run_resource_arena.h"
 
 #include "callable.h"
 #include "call_config.h"
 #include "prepare_callable_common.h"
 #include "utils/device_arena.h"
+#include "utils/retained_scheduler_storage.h"
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
+#include "common/device_run_result.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/dma_workspace.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "platform_comm/comm.h"
+#include "host/execution_mode_latch.h"
+#include "host/caller_device_buffers.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
+#include "host/host_phase_run_state.h"
+#include "host/run_resource_slots.h"
 #include "host/args_dump_collector.h"
+#include "host/host_graph_exporter.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
@@ -77,10 +86,22 @@ constexpr int SIM_AUTO_BLOCKDIM = 8;
 class SimDeviceRunnerBase {
 public:
     SimDeviceRunnerBase() {
-        for (auto &bank : arena_banks_) {
-            bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
-        }
+        commit_run_resources(kDefaultRunResourceSets, build_run_resources(kDefaultRunResourceSets));
     }
+
+    /**
+     * Size every per-run resource to the count of run-resource sets this
+     * context was granted.
+     *
+     * The grant is the worker's, not this module's: the module declares what it
+     * supports, and the worker decides how much of that this context uses. It
+     * arrives once, before any run can name a set. Refused once an arena bank
+     * is committed, because a run's lease names its set by index.
+     */
+    bool set_run_resource_grant(size_t granted);
+
+    /** How many run-resource sets this runner currently holds. */
+    size_t run_resource_grant() const { return granted_run_resource_sets_; }
 
     uint64_t arena_bank_gm_heap_base(uint32_t bank_id) const;
 
@@ -104,6 +125,7 @@ public:
             identity(identity_in),
             runtime(&runtime_in),
             config(config_in),
+            dfx(DfxRunConfig::from(config_in)),
             pipeline_slot(pipeline_slot_in) {}
         virtual ~PreparedExecution() = default;
         PreparedExecution(const PreparedExecution &) = delete;
@@ -112,17 +134,39 @@ public:
             identity(other.identity),
             runtime(std::exchange(other.runtime, nullptr)),
             config(other.config),
+            dfx(std::move(other.dfx)),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
-            launch_aicpu_num(other.launch_aicpu_num) {}
+            launch_aicpu_num(other.launch_aicpu_num),
+            artifact_identity(other.artifact_identity) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
         NativeRunIdentity identity{};
         Runtime *runtime{nullptr};
         CallConfig config{};
-        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        /**
+         * This run's diagnostics configuration, resolved from its own config.
+         *
+         * Every phase of the run reads its DFX configuration from here rather
+         * than from the runner's members, so that one run answers for its whole
+         * lifetime from a single value. A simulated device context takes the
+         * execution claim in simpler_prepare_run and therefore never prepares a
+         * successor against a live predecessor, so unlike onboard this carries
+         * no correctness weight here — it keeps the two runner shapes the same.
+         */
+        DfxRunConfig dfx{};
+        uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
+        /**
+         * This run's whole published identity, copied from its descriptor.
+         *
+         * `identity` above is what later phase calls address the run by and has
+         * no field for `run_id`; a diagnostic artifact needs that plus the
+         * submitting Worker's provenance to be attributed to its submission. An
+         * all-zero `owner_instance_id` means the caller stated none.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
     };
 
     struct ActiveExecution {
@@ -155,11 +199,58 @@ public:
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
     /** Return one of the SIMPLER_NATIVE_RUN_POLL_* values without waiting. */
     virtual int poll_execution(const ActiveExecution &active) = 0;
-    /** Wait for completion, publish DFX, and release per-run resources. */
-    virtual int drain_execution(ActiveExecution &active) = 0;
+    /**
+     * Wait for completion, publish DFX, and release per-run resources.
+     *
+     * Returns the device result and this run's diagnostics result separately;
+     * see `DrainOutcome`.
+     */
+    virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
     virtual int finalize() = 0;
-    // a2a3 and a5 both override; an arch without dep_gen leaves the no-op.
-    virtual void set_dep_gen_enabled(bool /*enable*/) {}
+    // Arms this thread's host-side dep_gen capture from the run's own config,
+    // before it binds. a2a3 and a5 both override; an arch without dep_gen leaves
+    // the no-op. See the onboard base for why it is not part of
+    // apply_call_config().
+    virtual void arm_host_dep_gen_capture(bool /*enable*/) {}
+
+    /**
+     * Cross-run retention for the DepGen collector, which lives on the arch
+     * `DeviceRunner` rather than on this base.
+     *
+     * The base owns the latch, the flush and the teardown, so it reaches that
+     * collector through these. Defaults are no-ops, so a runner without a
+     * DepGen collector inherits today's behaviour and a runtime that captures
+     * its graph on the host is unaffected. Same ownership split as
+     * `arm_host_dep_gen_capture` above.
+     */
+    virtual void configure_dep_gen_retention(bool /*enabled*/, std::size_t /*budget_bytes*/) {}
+    virtual bool dep_gen_retains_runs() const { return false; }
+    /**
+     * Admit this run before anything is submitted. Non-zero fails the launch.
+     *
+     * A refusal here has to give back what the other collectors already
+     * admitted, or their export slots stay occupied by a run that never
+     * reaches a boundary.
+     */
+    virtual int admit_dep_gen_run(const DfxRunConfig & /*dfx*/, uint64_t /*run_epoch*/) { return 0; }
+    /** Release an admitted run whose launch submitted nothing. */
+    virtual void withdraw_dep_gen_run(uint64_t /*run_epoch*/) noexcept {}
+    virtual bool dep_gen_flush_retained(int /*timeout_ms*/, std::string * /*error*/) { return true; }
+    virtual void dep_gen_finish_retained() {}
+
+    /**
+     * Hand this thread's finished host-built dependency graph to the exporter.
+     *
+     * Called from `prepare`, on the thread that ran the orchestration, at the
+     * point that thread used to serialize and write the file. With retention
+     * off, or for a runtime that captures its graph on the device, this is inert
+     * and the caller writes synchronously as before.
+     *
+     * Reports whether a graph that should have been published was. A failure is
+     * sticky until a flush reports it and never changes the run's result.
+     */
+    bool seal_host_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
+    bool host_graph_retains_runs() const { return host_graph_exporter_.retains_runs(); }
 
     /** Reserve the runner's single active native execution through finalize. */
     bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
@@ -185,7 +276,17 @@ public:
         void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
     );
 
-    std::thread create_thread(std::function<void()> fn);
+    /**
+     * Spawn a device-simulation thread bound to this runner's device.
+     *
+     * `name` is applied to the thread itself (Linux only, truncated to the
+     * kernel's 15-character limit); an empty name leaves the thread unnamed.
+     * A sim run holds one thread per simulated AICore plus one per AICPU, so
+     * over a hundred of them share this factory — without a name every one
+     * reports as the host process's own `comm` and a crash dump cannot say
+     * which tier faulted.
+     */
+    std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
 
     void *allocate_tensor(size_t bytes);
@@ -194,14 +295,108 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
+
+    /**
+     * Allocate for a caller and record the allocation as theirs; release it unless a run may still
+     * be using it. Same contract as the onboard runner's pair — see
+     * host/caller_device_buffers.h. A run's arguments may name only what a caller minted, so this
+     * runner's own regions keep going through `allocate_tensor` and stay unrecorded.
+     */
+    void *allocate_caller_buffer(size_t bytes);
+    int free_caller_buffer(void *dev_ptr);
+
+    bool borrow_caller_buffers(uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count);
+    void release_caller_buffers(uint64_t identity, bool keep);
+    /**
+     * Declare which caller allocations `identity` produces; see host/caller_device_buffers.h.
+     *
+     * @return false when the statement could not be recorded, which the declaring run's bind has
+     *         to treat as its own failure: an undeclared producer reads as no producer.
+     */
+    [[nodiscard]] bool declare_caller_buffer_writes(
+        uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count, size_t *unresolved_out = nullptr
+    ) {
+        return caller_device_buffers_.declare_writes(identity, spans, count, unresolved_out);
+    }
+
+    /** Whether `[addr, addr + bytes)` has no readable content for `identity` yet. */
+    bool caller_buffer_written_by_other_run(uint64_t identity, uint64_t addr, uint64_t bytes) const {
+        return caller_device_buffers_.written_by_other_run(identity, addr, bytes);
+    }
+    size_t caller_buffer_count() const { return caller_device_buffers_.allocation_count(); }
+    size_t caller_buffer_borrow_count() const { return caller_device_buffers_.borrow_count(); }
+    size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
+
     int device_memset(void *dev_ptr, int value, size_t bytes);
+
+    /**
+     * This slot's run-result region, as the address a run's device side
+     * publishes into.
+     *
+     * Handed to the AICPU SO with the run's epoch: the two are only meaningful
+     * together, since the host decides what belongs to a run by comparing
+     * epochs. Zero for a slot outside the array, which the caller publishes as
+     * "no region" exactly as it did before one existed.
+     */
+    uint64_t run_result_region_base(uint32_t pipeline_slot);
+
+    /**
+     * That run's published diagnostic payload, or null when it published none.
+     *
+     * Null covers every undecided case the channel defines — never published,
+     * published under another run's epoch, or self-inconsistent — and they are
+     * deliberately not distinguished here: a caller that receives no payload
+     * has no diagnostic scene to read either way.
+     */
+    const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
+
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
-    int acquire_graph_definition_block(
-        uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+    int acquire_graph_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out);
+    /**
+     * Take this run's packed Definition section into its run-owned snapshot.
+     *
+     * Simulation has no launch package and no RTS to copy one: the device side
+     * is called in-process with the `Runtime`, so the section is delivered as a
+     * host snapshot this runner owns. It is copied out of the bind's staging
+     * rather than aliasing it, so a later bind growing that staging cannot move
+     * the bytes a run is still reading, and it stays pinned until this slot's
+     * next publication or the runner's release.
+     *
+     * Reports `GraphSectionSource::HostSnapshot` and the snapshot's address.
+     */
+    int publish_graph_section(
+        uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
+    /**
+     * Hand one pipeline slot its retained scheduler-state storage, both sides.
+     *
+     * Same contract as the onboard runner's: grow-only per slot, host side
+     * prepared before the "device" one (host memory here too), the previous
+     * block kept when a replacement cannot be allocated, one failed-release
+     * record per slot that refuses further growth, and no clearing — the
+     * caller writes the whole range it uses before shipping it.
+     */
+    int acquire_scheduler_state_storage(
+        uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+    );
+    std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
+        return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
+    }
+    void set_orchestration_scratch(uint32_t slot, std::shared_ptr<void> scratch) {
+        if (slot < orchestration_scratch_.size()) orchestration_scratch_[slot] = std::move(scratch);
+    }
     int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
+    /**
+     * Retain the host buffer a run assembles its device execution image in.
+     *
+     * Same retention contract as the shared-memory mirror above, and for the
+     * same reason a run needs it: the publication that ships these bytes is a
+     * separate step, so the source has to outlive the preparation that wrote
+     * it rather than dying with the caller's frame.
+     */
+    int acquire_run_image_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     void clear_temporary_buffer();
 
     // On sim, allocate_tensor returns a plain host pointer, so the "device"
@@ -213,19 +408,30 @@ public:
     }
     void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
+    /**
+     * Host view of a child-memory address for a host-side orchestrator.
+     *
+     * Identity here, and holds nothing: `allocate_tensor` already returns host
+     * memory, so there is no mapping to establish, cache or release — the
+     * onboard counterpart's allocation-lifetime cache has no work to do. The
+     * containment check still runs, so a span outside every tracked allocation
+     * fails closed exactly as it does onboard.
+     */
+    void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes);
+
     int record_device_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
-        size_t orch_so_size, const char *func_name, const char *config_name,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        size_t orch_so_size, const char *func_name, const char *config_name, std::vector<ArgDirection> signature
     );
     int record_host_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
-        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        std::vector<ArgDirection> signature
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
-    // One-step bind: replay CallableState (kernel addrs + active_callable_id)
-    // then run the per-run bind_callable_to_runtime_impl with the state's
+    // One-step bind: install the reference to the callable's
+    // registration-owned function tables and its active_callable_id, then run
+    // the per-run bind_callable_to_runtime_impl with the state's
     // host_orch_func_ptr + signature. `api` is bound to this run; `orch_args` is a
     // const ChipStorageTaskArgs* (void* keeps task_interface headers out of this
     // header). Returns 0 on success, non-zero on failure.
@@ -260,6 +466,14 @@ public:
     void set_dma_workspace_request(bool enable_sdma) { sdma_requested_ = enable_sdma; }
     int ensure_dma_workspace_provisioned();
     int device_id() const { return device_id_; }
+
+    /**
+     * This context's execution identity, latched once by whichever init entry
+     * constructs it. Simulation supports program mode only: it has no device
+     * streams for a caller to lend.
+     */
+    ExecutionModeLatch &execution_mode_latch() { return execution_mode_latch_; }
+
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
     // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
     // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
@@ -276,35 +490,155 @@ public:
     uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
     uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
 
-    void set_chip_swimlane_enabled(int level) {
-        chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level);
-        enable_chip_swimlane_ = (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED);
-    }
+    void set_chip_swimlane_enabled(int level) { chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level); }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
     bool
     publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
         return json_value != nullptr &&
                chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
     }
-    HostPhaseRecordPool *host_phase_pool_arm(bool producer_wants_records) noexcept;
-    void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
-        host_phase_records_.finish(submitted_tasks, invocation_id);
+    /** Hand one slot's host-phase state to the run about to bind into it. */
+    void begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx);
+    HostPhaseRecordPool *host_phase_pool_arm(uint32_t pipeline_slot, bool producer_wants_records) noexcept;
+    void host_phase_pool_finish(uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return;
+        host_phase_runs_[pipeline_slot].records.finish(submitted_tasks, invocation_id);
     }
-    const simpler::dfx::HostPhaseRecordStore &host_phase_records() const { return host_phase_records_; }
+    /** Hand this run's host-phase state to the resident collector, at launch. */
+    void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
+    bool host_clock_alignment_log_required(uint32_t pipeline_slot) const {
+        return pipeline_slot < host_phase_runs_.size() && host_phase_runs_[pipeline_slot].needs_clock_alignment();
+    }
+    /**
+     * This slot's own host-orchestration state, for a run that must not read
+     * the collector's single resident copy.
+     */
+    bool host_orchestrated_for_slot(uint32_t pipeline_slot) const noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return false;
+        return host_phase_runs_[pipeline_slot].host_orchestrated;
+    }
     /** Hand this pass's records to the swimlane reader, just before its export. */
-    void publish_host_phase_records_to_swimlane();
-    /** Start the level-4 Host/Device clock correlation once per run. */
-    void begin_clock_correlation_session_if_needed() noexcept;
-    void finish_clock_correlation_session(bool capture_device_complete) noexcept;
-    void set_dump_args_enabled(int level) {
-        dump_args_level_ = static_cast<DumpArgsLevel>(level);
-        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
+    void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
+    /**
+     * Publish arch-specific runtime metadata into the swimlane export, between
+     * the host-phase handoff and the export itself — the only point at which the
+     * collector holds this run's records but has not yet serialized them. a5
+     * overrides it; every other arch has nothing to add.
+     */
+    virtual void publish_chip_swimlane_runtime_extensions() {}
+    /**
+     * Open this run's collection window on the four shared diagnostics
+     * collectors it enables, and start their mgmt + poll threads. Each block is
+     * gated on `dfx`, this run's own configuration, not on the runner's members.
+     * Mirrors the onboard base, where opening the window at launch is what keeps
+     * a resident collector's per-run state off a live predecessor. Subclasses
+     * with arch-specific collectors (`dep_gen_collector_`) call this and then
+     * open and start their own.
+     *
+     * Returns non-zero when a collector that retains runs would not admit this
+     * one; see the onboard base for why that fails the run.
+     */
+    int start_shared_collectors_for_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+    );
+
+    /**
+     * Give back what the call above admitted for a run that submitted nothing.
+     * Only for a `LaunchProgress::NotStarted` transaction; see the onboard base
+     * for why a partial submission must keep its slot.
+     */
+    void withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
+
+    /**
+     * Close one run's PMU window: either today's drain and reconcile, or, when
+     * PMU retains runs, the claim-time snapshot that hands the epoch to its
+     * background writer.
+     */
+    void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void close_scope_stats_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
+    /**
+     * Close one run's ArgsDump window: either today's quiesce, reconcile and
+     * export, or, when ArgsDump retains runs, the claim-time terminal read,
+     * processing proof and leftover decision that hand the run to its
+     * background writer.
+     *
+     * Returns non-zero only on the retained path, when that proof did not land
+     * inside the execution claim. Nothing unproved was read and no unprocessed
+     * payload was acknowledged, so the producer's own barrier still protects
+     * the arena — but the caller owes an error rather than a run that quietly
+     * publishes an incomplete file.
+     */
+    int close_args_dump_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
+    /**
+     * Whether a collector may hold a run past its boundary. Default off, and
+     * both retaining collectors are configured here for the reason the onboard
+     * base gives. PMU retention is independent of swimlane's.
+     */
+    void set_retain_runs(bool enabled) {
+        chip_swimlane_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        dump_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        pmu_collector_.configure_retained_runs(enabled);
+        scope_stats_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        configure_dep_gen_retention(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        // A host-orchestrating runtime's graph is finished inside `prepare` and
+        // never reaches a device collector, so it has an owner of its own.
+        host_graph_exporter_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
     }
-    void set_pmu_enabled(int enable_pmu) {
-        enable_pmu_ = (enable_pmu > 0);
-        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
+    bool retains_runs() const {
+        return chip_swimlane_collector_.retains_runs() || dump_collector_.retains_runs() ||
+               pmu_collector_.retains_runs();
     }
-    void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+    int flush_diagnostics(int timeout_ms, std::string *error);
+    void finish_retained_runs();
+    /**
+     * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
+     * return its device address for KernelArgs.
+     *
+     * The bank is the slice of the collector's retained region into which each
+     * producer copies its settled record totals at its last flush, so those
+     * totals survive the next run's counter reset. Indexed by the run's actual
+     * pipeline slot; returns 0 whenever no bank can be resolved (swimlane off,
+     * collector not initialized, slot out of range, or no run identity), which
+     * the device reads as "publish no snapshot". Diagnostic-only and never a
+     * prepare failure. Mirrors the onboard base.
+     */
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
+    /** Write this pass's per-event host phase records, if it collected any. */
+    void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
+    /**
+     * Tear down the four shared diagnostics collectors after the launched
+     * kernels have synced, in the one order their couplings allow: the clock
+     * correlation session closes before the swimlane export reads it, and each
+     * collector drains before it reconciles before it exports. Each block is
+     * gated on `dfx`, this run's own configuration.
+     *
+     * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
+     * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
+     * calling this helper, as on onboard.
+     *
+     * `run_epoch` identifies the run whose retained terminal snapshot is read
+     * back, which happens only when `device_execution_complete` says the caller
+     * observed this run's completion.
+     *
+     * `device_producers_stopped` is the separate fact that no producer can
+     * still be writing into this run's terminal bank. A simulated device's
+     * producers are the AICPU and AICore threads of this process, so a caller
+     * that joined them knows it; pass it only from such a caller. It decides
+     * whether a *failed* run's bank is returned unread or withdrawn, and it
+     * never licenses reading a snapshot the run did not complete.
+     */
+    /**
+     * Returns non-zero when a collector's close reported an ownership failure
+     * the caller must surface — today only retained ArgsDump. A caller folds it
+     * into its own rc behind any device error, which stays the more useful
+     * diagnosis.
+     */
+    int teardown_shared_collectors_after_run(
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
+        bool device_producers_stopped
+    );
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -333,21 +667,36 @@ protected:
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
     void release_callable_state();
-    void release_graph_definition_blocks();
+    void release_graph_definition_staging();
+
+    /**
+     * Release every slot's retained scheduler-state storage.
+     *
+     * Returns the first failing free's code, having attempted every block, and
+     * records each outcome before the slot's entry is cleared.
+     */
+    int release_scheduler_state_storage();
 
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
+    void release_run_image_stagings();
 
     // --- Shared state (protected so subclass execution / init_* / finalize()
     // can read or write directly) ----------------------------------------
 
-    // Configuration. device_id_ is set once in attach_current_thread() during
-    // simpler_init and read afterwards; the user's call sequence is single-
-    // threaded with respect to it so plain int is sufficient.
+    // Configuration. device_id_ is which device this context is on — not a
+    // claim of ownership, which the execution-mode latch carries instead. Set
+    // once in attach_current_thread() during simpler_init and read afterwards;
+    // the user's call sequence is single-threaded with respect to it so plain
+    // int is sufficient.
     int device_id_{-1};
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
+
+    // This context's execution identity. Write-once: the first init entry to
+    // run latches it, and it never changes afterwards.
+    ExecutionModeLatch execution_mode_latch_;
 
     // Executor binaries — populated once via set_executors() during simpler_init,
     // owned for the rest of the runner's lifetime.
@@ -359,23 +708,27 @@ protected:
     uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
 
     MemoryAllocator mem_alloc_;
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
-    std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // Graph Definition storage, one retained block per pipeline slot — see
-    // HostApi acquire_graph_definition_block. `staging` is the host block the
-    // run's Definition objects are packed into and stays allocated across runs,
-    // so a bind neither acquires nor returns host memory for them; the device
-    // side is the raw allocation plus the aligned address handed out. One block
-    // per slot rather than one per Definition: every Definition of a run is
-    // packed end to end and shipped by a single H2D, and every submission
-    // references the device-resident copy of its own Definition.
-    struct RetainedGraphBlock {
-        void *allocation{nullptr};
-        void *aligned_addr{nullptr};
-        size_t capacity{0};
-        std::vector<std::byte> staging;
+    // The device allocations a caller minted through this context, and which runs still hold them
+    // — see host/caller_device_buffers.h.
+    CallerDeviceBuffers caller_device_buffers_;
+    RunResourceSlots<void *> retained_temp_addrs_;
+    RunResourceSlots<size_t> retained_temp_sizes_;
+    // One pipeline slot's Graph Definition bytes: `staging` is what the
+    // recorders build their objects into, grow-only and content-preserving, and
+    // `snapshot` is the copy a published run reads. Two buffers rather than one
+    // because the device side reads the snapshot in this same process: a later
+    // bind growing the staging must not move bytes a run still names. No device
+    // member — simulation allocates no device Definition block either.
+    struct RetainedGraphStaging {
+        std::vector<std::byte> bytes;
+        std::vector<std::byte> snapshot;
     };
-    std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
+    // Scheduler-state storage, one retained pair per pipeline slot — see
+    // HostApi acquire_scheduler_state_storage and
+    // utils/retained_scheduler_storage.h, which holds the grow, alignment and
+    // failure rules.
+    RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -395,7 +748,18 @@ protected:
         std::unique_ptr<std::byte[]> storage;
         size_t capacity{0};
     };
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+    RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
+    RunResourceSlots<RetainedSmMirror> sm_mirrors_;
+
+    // Host staging for the device execution image, one retained buffer per
+    // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
+    // and the same grow-only retention as the mirror above; what differs is
+    // what it holds and how long it has to hold it. A bind assembles the
+    // bytes here and records where they go; the publication reads them
+    // afterwards, so this buffer is what makes the source outlive the
+    // preparation. Sized to the image a bind ships rather than to the
+    // mirror's capacity.
+    RunResourceSlots<RetainedSmMirror> run_image_stagings_;
 
     // Each arena bank backs the three pooled regions (GM heap / shared
     // shared memory / trb prebuilt runtime arena) for one pipeline slot. They
@@ -429,8 +793,31 @@ protected:
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
     };
-    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    RunResourceSlots<std::unique_ptr<ArenaBank>> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
+    // How many run-resource sets every per-set container holds. Written last by
+    // `commit_run_resources`, so until a grant is published every bound check
+    // still answers for the previous one.
+    size_t granted_run_resource_sets_{0};
+
+    /** One built, unpublished grant: every per-set container's new storage. */
+    struct RunResourceStaging {
+        RunResourceSlots<void *>::Storage retained_temp_addrs;
+        RunResourceSlots<size_t>::Storage retained_temp_sizes;
+        RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
+        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
+        RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
+        RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
+        RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
+        RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+    };
+
+    /** Allocate every per-set resource for `granted`; publishes nothing. */
+    RunResourceStaging build_run_resources(size_t granted);
+    /** Adopt a built grant by swapping every container. Never throws. */
+    void commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept;
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
@@ -471,6 +858,18 @@ protected:
         size_t total_size{0};
         int refcount{0};
         std::vector<void *> dlopen_handles;
+        // The callable's registration-owned function tables, dense over
+        // [0, table_len). Sim performs no upload, so the "device" addresses
+        // below are the vectors' own host addresses and the AICPU reads them in
+        // place. The object view holds the CoreCallable objects inside
+        // `host_scratch`; the entry view holds the host function pointers this
+        // registration's dlopen resolved, which is what a device consumer of
+        // resolved entries would dispatch through.
+        std::vector<uint64_t> object_table;
+        std::vector<uint64_t> entry_table;
+        uint64_t object_table_dev{0};
+        uint64_t entry_table_dev{0};
+        uint32_t table_len{0};
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
@@ -484,7 +883,6 @@ protected:
         std::string func_name;
         std::string config_name;
         // common
-        std::vector<std::pair<int, uint64_t>> kernel_addrs;
         std::vector<ArgDirection> signature;
         // hbg path
         void *host_dlopen_handle{nullptr};
@@ -517,11 +915,35 @@ protected:
     // Not a collector: the pool the runtime's prepare path writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
     // independently, so it belongs to neither.
-    simpler::dfx::HostPhaseRecordStore host_phase_records_;
-    std::unique_ptr<simpler::dfx::ClockCorrelationProvider> clock_correlation_provider_{};
+    // One entry per pipeline slot, indexed by the run descriptor's slot. Only
+    // one is ever live here — sim prepares under the exclusive execution claim,
+    // so it stages no successor (see `supports_concurrent_native_prepare_ctx`
+    // in c_api_shared.cpp). The array keeps this storage the same shape as the
+    // onboard base's, which is what lets the shared host-phase code index by
+    // slot without a per-platform branch.
+    RunResourceSlots<HostPhaseRunState> host_phase_runs_;
+    /**
+     * One run's device-side terminal result, per pipeline slot.
+     *
+     * The same obligation the onboard base carries (see
+     * common/device_run_result.h): a runtime folds what the host needs into
+     * this region and publishes it before its kernel returns, so a run's own
+     * status is readable without naming shared state a later run resets. Here
+     * the simulated device writes host memory directly, so the region is the
+     * storage itself rather than a cached copy of a device allocation, and no
+     * transfer stands between the publisher and the reader.
+     *
+     * Value-initialized once and never cleared per run: `published` carries the
+     * publishing run's epoch, so a slot still holding an earlier run's record
+     * fails the epoch comparison rather than being mistaken for this run's.
+     */
+    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
+    // The host-built graph's owner. Not a device collector: nothing it holds
+    // is written by the device, and no run boundary reads it.
+    simpler::dfx::host_graph::HostGraphExporter host_graph_exporter_;
 
     /**
      * The core and AICPU-thread counts a resident collector's pools were built
@@ -547,17 +969,11 @@ protected:
      *
      * The release frees device memory the collectors are holding, so it is only
      * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it today is the diagnostics depth-1 gate: with any
-     * diagnostic on, `allow_prepared_successor` is false, so a successor cannot
-     * even reserve while a predecessor is in flight, and a stale shape is only
-     * ever seen between runs.
-     *
-     * **Whoever lifts that gate must move this rebuild inside the execution
-     * claim.** Do not reach for `native_run_active()` as the guard — it is not a
-     * usable predicate at this point: onboard takes the claim in
-     * `simpler_launch_run`, but sim takes it in `simpler_prepare_run`, so on sim
-     * it is already true for the run being prepared and the check fires on its
-     * own run.
+     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
+     * sole user, and it runs from the launch arming, under the execution claim.
+     * A simulated context takes that claim at prepare and never overlaps two
+     * runs, so this holds here by construction; the call stays in the launch
+     * arming anyway, because the two runner shapes are kept identical.
      */
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&
@@ -574,15 +990,10 @@ protected:
 
     CollectorShape collector_shape_{};
 
-    // Enablement flags. Written before enqueue and read by execution helpers.
-    bool enable_chip_swimlane_{false};
-    bool enable_dump_args_{false};
-    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
-    bool enable_pmu_{false};
-    bool enable_scope_stats_{false};
+    // Enablement flags. A run's own diagnostics configuration travels on its
+    // PreparedExecution::dfx; the runner keeps only what a device-context query
+    // answers from, plus the artifact root the host-phase pool arms against.
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};         // resolved from set_pmu_enabled()
-    bool capture_clock_anchors_{false};                                   // from CallConfig::capture_clock_anchors
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
 

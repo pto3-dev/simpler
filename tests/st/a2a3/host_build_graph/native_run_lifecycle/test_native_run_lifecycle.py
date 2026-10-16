@@ -73,14 +73,16 @@ class TestNativeRunLifecycle(SceneTestCase):
 
         spans = list(parse_spans(drain_host_log(capfd).splitlines()))
         invocations = [inv for inv in group_invocations(spans) if "chip.run" in inv.by_name()]
-        # Two of these are the abandoned diagnostic prepares below, which record a
-        # chip.run invocation without ever reaching chip.run.runner_run.
-        expected_invocations = 5 if st_platform.endswith("sim") else 9
+        # The onboard count includes the two diagnostic-config pairs below, each
+        # of which now runs an active predecessor and a prepared successor to
+        # completion rather than having its successor refused.
+        expected_invocations = 5 if st_platform.endswith("sim") else 11
         assert len(invocations) == expected_invocations
 
         common_depths = {
             "chip.run": 0,
             "chip.run.bind": 1,
+            "chip.run.prepare_execution": 1,
             "chip.run.validate": 1,
         }
         launched_depths = {
@@ -96,6 +98,11 @@ class TestNativeRunLifecycle(SceneTestCase):
             assert expected_depths.keys() <= by_name.keys()
             assert len({span.hid for span in invocation.spans}) == 1
             assert sum(span.name == "chip.run" for span in invocation.spans) == 1
+            # One closed record per prepare, on the run that prepared: an
+            # abandoned prepare has one just as a launched run does, and a
+            # successor prepared against an in-flight predecessor stamps its own
+            # invocation rather than appending to the predecessor's.
+            assert sum(span.name == "chip.run.prepare_execution" for span in invocation.spans) == 1
             for name, depth in expected_depths.items():
                 assert by_name[name].depth == depth
 
@@ -104,7 +111,7 @@ class TestNativeRunLifecycle(SceneTestCase):
             for name in expected_depths.keys() - {"chip.run", "chip.run.runner_run.device_wall"}:
                 stage = by_name[name]
                 assert root.ts <= stage.ts <= stage.ts + stage.dur <= root_end
-        expected_launched = 2 if st_platform.endswith("sim") else 6
+        expected_launched = 2 if st_platform.endswith("sim") else 8
         assert launched_count == expected_launched
         if not st_platform.endswith("sim"):
             root_attrs = [inv.by_name()["chip.run"].attrs for inv in invocations]
@@ -134,8 +141,8 @@ class TestNativeRunLifecycle(SceneTestCase):
         config = self._build_config(case.get("config", {}))
         chip_worker = worker._chip_worker
         assert chip_worker is not None
-        supports_concurrent_prepare = bool(chip_worker._impl.supports_concurrent_native_prepare)
-        chip_worker._register_callable_at_slot(_SLOT, callable_obj)
+        supports_concurrent_prepare = bool(chip_worker.supports_concurrent_native_prepare)
+        chip_worker.register_callable(_SLOT, callable_obj)
         native_run = None
         successor_run = None
         try:
@@ -146,7 +153,7 @@ class TestNativeRunLifecycle(SceneTestCase):
 
             stream_count_before_prepare = chip_worker.run_stream_set_create_count
             native_run = chip_worker._prepare_native_run_with_pipeline_lease(
-                _SLOT, chip_args, _SLOT, _GENERATION, config=config
+                _SLOT, chip_args, slot_id=_SLOT, generation=_GENERATION, config=config
             )
             first_run = native_run
             # Preparation stops short of the device launch fence, and that
@@ -156,19 +163,21 @@ class TestNativeRunLifecycle(SceneTestCase):
             assert chip_worker.run_stream_set_create_count == stream_count_before_prepare
             assert torch.count_nonzero(test_args.out) == 0, "prepare crossed the device launch fence"
             with pytest.raises(RuntimeError, match="unfinished native run|owns the runner|active predecessor"):
-                chip_worker._prepare_native_run_with_pipeline_lease(_SLOT, chip_args, 1, _GENERATION, config=config)
+                chip_worker._prepare_native_run_with_pipeline_lease(
+                    _SLOT, chip_args, slot_id=1, generation=_GENERATION, config=config
+                )
             with pytest.raises(RuntimeError, match="unregister_callable failed"):
-                chip_worker._unregister_slot(_SLOT)
+                chip_worker.unregister_callable(_SLOT)
             with pytest.raises(RuntimeError, match="register_callable failed"):
-                chip_worker._register_callable_at_slot(1, callable_obj)
+                chip_worker.register_callable(1, callable_obj)
 
             # A prepared run can be abandoned explicitly. Finalize releases its
             # claim and registry dependencies without launching or copying back.
             chip_worker._finalize_native_run(native_run)
             native_run = None
             assert torch.count_nonzero(test_args.out) == 0
-            chip_worker._unregister_slot(_SLOT)
-            chip_worker._register_callable_at_slot(_SLOT, callable_obj)
+            chip_worker.unregister_callable(_SLOT)
+            chip_worker.register_callable(_SLOT, callable_obj)
 
             # Prepare initializes this run's diagnostics collectors, so abandoning
             # it must release them. Each collector refuses a second initialize()
@@ -182,7 +191,7 @@ class TestNativeRunLifecycle(SceneTestCase):
                 abandon_chip_args, _ = _build_chip_task_args(abandon_args, self.CALLABLE["orchestration"]["signature"])
                 for _ in range(2):
                     abandoned = chip_worker._prepare_native_run_with_pipeline_lease(
-                        _SLOT, abandon_chip_args, _SLOT, _GENERATION, config=abandon_config
+                        _SLOT, abandon_chip_args, slot_id=_SLOT, generation=_GENERATION, config=abandon_config
                     )
                     chip_worker._finalize_native_run(abandoned)
                 assert torch.count_nonzero(abandon_args.out) == 0
@@ -192,7 +201,7 @@ class TestNativeRunLifecycle(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, case["params"])
             native_run = chip_worker._prepare_native_run_with_pipeline_lease(
-                _SLOT, chip_args, _SLOT, _GENERATION, config=config
+                _SLOT, chip_args, slot_id=_SLOT, generation=_GENERATION, config=config
             )
             assert first_run.generation == native_run.generation
             assert first_run.run_epoch != native_run.run_epoch
@@ -215,7 +224,7 @@ class TestNativeRunLifecycle(SceneTestCase):
             )
             second_golden = second_args.clone()
             self.compute_golden(second_golden, case["params"])
-            chip_worker._run_slot(_SLOT, second_chip_args, config=config)
+            chip_worker.run(_SLOT, second_chip_args, config=config)
             _compare_outputs(second_args, second_golden, second_output_names, self.RTOL, self.ATOL)
 
             if supports_concurrent_prepare:
@@ -239,12 +248,12 @@ class TestNativeRunLifecycle(SceneTestCase):
                 successor_args, successor_chip_args, successor_outputs, successor_golden = build_run_args()
                 stream_count = chip_worker.run_stream_set_create_count
                 native_run = chip_worker._prepare_native_run_with_pipeline_lease(
-                    _SLOT, active_chip_args, 0, _GENERATION + 1, config=config
+                    _SLOT, active_chip_args, slot_id=0, generation=_GENERATION + 1, config=config
                 )
                 assert chip_worker.run_stream_set_create_count == stream_count
                 chip_worker._launch_native_run(native_run)
                 successor_run = chip_worker._prepare_native_run_with_pipeline_lease(
-                    _SLOT, successor_chip_args, 1, _GENERATION, config=config
+                    _SLOT, successor_chip_args, slot_id=1, generation=_GENERATION, config=config
                 )
                 assert chip_worker.run_stream_set_create_count == stream_count
                 bank0 = chip_worker.arena_bank_gm_heap_base(0)
@@ -276,37 +285,47 @@ class TestNativeRunLifecycle(SceneTestCase):
                     diagnostic_config.enable_dep_gen = True
                     diagnostic_config.output_prefix = output_dir
 
-                    # A diagnostic successor cannot overlap an ordinary active
-                    # run, even though the predecessor otherwise permits one.
+                    # A diagnostic successor overlaps an ordinary active run like
+                    # any other: its collector pools and per-run state are built
+                    # and reset under the execution claim, so its preparation
+                    # touches nothing the predecessor is using.
                     active_args, active_chip_args, active_outputs, active_golden = build_run_args()
                     native_run = chip_worker._prepare_native_run_with_pipeline_lease(
-                        _SLOT, active_chip_args, 0, _GENERATION + 2, config=config
+                        _SLOT, active_chip_args, slot_id=0, generation=_GENERATION + 2, config=config
                     )
                     chip_worker._launch_native_run(native_run)
-                    with pytest.raises(RuntimeError, match="active predecessor"):
-                        chip_worker._prepare_native_run_with_pipeline_lease(
-                            _SLOT, successor_chip_args, 1, _GENERATION + 1, config=diagnostic_config
-                        )
+                    successor_run = chip_worker._prepare_native_run_with_pipeline_lease(
+                        _SLOT, successor_chip_args, slot_id=1, generation=_GENERATION + 1, config=diagnostic_config
+                    )
                     chip_worker._wait_native_run(native_run)
                     chip_worker._finalize_native_run(native_run)
                     native_run = None
                     _compare_outputs(active_args, active_golden, active_outputs, self.RTOL, self.ATOL)
+                    chip_worker._launch_native_run(successor_run)
+                    chip_worker._wait_native_run(successor_run)
+                    chip_worker._finalize_native_run(successor_run)
+                    successor_run = None
 
-                    # A diagnostic predecessor also cannot admit an ordinary
-                    # successor while it owns the execution claim.
+                    # And a diagnostic predecessor admits an ordinary successor
+                    # while it owns the execution claim, for the same reason.
+                    successor_args, successor_chip_args, successor_outputs, successor_golden = build_run_args()
                     active_args, active_chip_args, active_outputs, active_golden = build_run_args()
                     native_run = chip_worker._prepare_native_run_with_pipeline_lease(
-                        _SLOT, active_chip_args, 0, _GENERATION + 3, config=diagnostic_config
+                        _SLOT, active_chip_args, slot_id=0, generation=_GENERATION + 3, config=diagnostic_config
                     )
                     chip_worker._launch_native_run(native_run)
-                    with pytest.raises(RuntimeError, match="active predecessor"):
-                        chip_worker._prepare_native_run_with_pipeline_lease(
-                            _SLOT, successor_chip_args, 1, _GENERATION + 1, config=config
-                        )
+                    successor_run = chip_worker._prepare_native_run_with_pipeline_lease(
+                        _SLOT, successor_chip_args, slot_id=1, generation=_GENERATION + 1, config=config
+                    )
                     chip_worker._wait_native_run(native_run)
                     chip_worker._finalize_native_run(native_run)
                     native_run = None
                     _compare_outputs(active_args, active_golden, active_outputs, self.RTOL, self.ATOL)
+                    chip_worker._launch_native_run(successor_run)
+                    chip_worker._wait_native_run(successor_run)
+                    chip_worker._finalize_native_run(successor_run)
+                    successor_run = None
+                    _compare_outputs(successor_args, successor_golden, successor_outputs, self.RTOL, self.ATOL)
         finally:
             for unfinished_run in (successor_run, native_run):
                 if unfinished_run is None:
@@ -315,7 +334,7 @@ class TestNativeRunLifecycle(SceneTestCase):
                     chip_worker._finalize_native_run(unfinished_run)
                 except Exception:
                     pass
-            chip_worker._unregister_slot(_SLOT)
+            chip_worker.unregister_callable(_SLOT)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#ifndef SCHEDULER_CONTEXT_H
-#define SCHEDULER_CONTEXT_H
+#pragma once
 
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -22,14 +21,10 @@
 #include "aicore_completion_mailbox.h"
 #include "dispatch_payload.h"
 
-// These macros are defined in runtime.h, but we cannot include it here
-// (it pulls in Handshake which we only forward-declare).  Mirror the
-// authoritative values so the class layout compiles standalone.
+// runtime.h pulls in Handshake, which this header only forward-declares.
+// RUNTIME_MAX_WORKER derives from the same platform core count in both headers.
 #ifndef RUNTIME_MAX_WORKER
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
-#endif
-#ifndef RUNTIME_MAX_FUNC_ID
-#define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
 // Forward declarations — avoid pulling in full headers for pointer/reference params.
@@ -80,7 +75,7 @@ public:
     // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
     // its own CoreTracker + per-core payload state for the clusters it owns, right
     // after handshaking them — no all-thread barrier or leader post_handshake_init.
-    void assign_own_clusters(int32_t tidx);
+    void assign_own_clusters(Runtime *runtime, int32_t tidx);
     // Latch completion + shutdown cores on a handshake failure seen without the
     // barrier (non-DFX path). Idempotent.
     void abort_and_shutdown(Runtime *runtime);
@@ -103,10 +98,10 @@ public:
     // Main scheduler thread entry: poll completion + dispatch ready tasks.
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
-    // Shutdown AICore registers for this thread's assigned cores.
-    // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
-    // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
-    int32_t shutdown(int32_t thread_idx);
+    // Retire the cores this thread owns, on its way out of resolve_and_dispatch.
+    // Orchestrator threads own none and no-op. Runs before the completion
+    // latch, so no run() exit path can leave a worker blocked on its gate.
+    int32_t shutdown(int32_t thread_idx, Runtime *runtime);
 
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -138,6 +133,7 @@ public:
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
 
 private:
+    friend class SchedulerContextTestPeer;
     // =========================================================================
     // State
     // =========================================================================
@@ -151,6 +147,19 @@ private:
 
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
+
+    // early_dispatch_shape's batch-pop scratch, one set per scheduler thread. The
+    // two arrays are indexed in lockstep: task_id_snapshots[i] is the tag batch[i]
+    // was queued with. Pure scratch -- pop_batch_tagged writes every element a
+    // later read touches, so nothing here carries meaning across calls or runs and
+    // deinit() leaves it alone. It lives here rather than on that function's stack
+    // so the TaskId array's default construction is paid once, at construction,
+    // instead of on every dispatch attempt that finds a free core.
+    struct EarlyStagingScratch {
+        ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+        TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+    };
+    EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
 
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
@@ -180,7 +189,20 @@ private:
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     std::atomic<bool> fatal_shutdown_started_{false};
+    // READY publishes completed initialization, or an opened window on startup
+    // failure. REQUESTED retains an exit request before that publication. Only
+    // the operation adding the second bit owns the core's window and return gate.
+    // Indexed by core id and reset before handshake in each generation.
+    static constexpr uint8_t RETIREMENT_READY = 1;
+    static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
+    // The active callable's registration-owned object-address table and the
+    // number of entries it holds, both bound from the descriptor in the cold
+    // path. The table is in the callable's registration block, not in the
+    // descriptor, so the length is the only bound available here: an index past
+    // it is unmapped rather than in-range-and-zero.
     uint64_t *func_id_to_addr_{nullptr};
+    uint32_t func_id_to_addr_count_{0};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
@@ -225,6 +247,14 @@ private:
     // exit to every handshake'd core. Idempotent.
     bool begin_emergency_shutdown();
     void signal_emergency_shutdown(Runtime *runtime);
+    // Request the named cores; an unpublished core is retired by its publisher.
+    // The second-bit winner alone reads execution state and manages the window.
+    int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_retirement_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_all_retirement_cores(Runtime *runtime);
+    void publish_retirement_group(Runtime *runtime, int32_t owner_thread);
+    int32_t retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    int32_t retire_all_cores(Runtime *runtime);
     void emergency_shutdown(Runtime *runtime);
 
     // =========================================================================
@@ -480,10 +510,14 @@ private:
     check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
 
     __attribute__((noinline, cold)) void
-    log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
+    log_stall_diagnostics(int32_t thread_idx, int32_t idle_iterations, StallDumpReport report);
+
+    __attribute__((noinline, cold)) void
+    log_global_stall_diagnostics(int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count);
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
-        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count,
+        const char *reason
     );
 
     // Reverse lookup: given a global core_id, find which scheduler thread's
@@ -511,18 +545,18 @@ private:
     // dominant SIMPLER_STALL_DETAIL_* sub-class plus a few locator fields, which
     // handle_timeout_exit propagates to host alongside the unchanged code 100.
     struct StallClassification {
-        int32_t detail;         // SIMPLER_STALL_DETAIL_*
-        int32_t cnt_running;    // tasks observed RUNNING (on a core)
-        int32_t cnt_ready;      // fanin-satisfied but not dispatched
-        int32_t cnt_waiting;    // still waiting on fanin
-        int32_t completed;      // completed_tasks_ snapshot
-        int32_t total;          // total_tasks_ snapshot
-        int32_t orch_done;      // orchestrator_done flag (0/1)
-        int64_t stuck_task_id;  // S1: first RUNNING task's id (-1 if none)
-        int32_t stuck_core;     // S1: core hosting it (-1 if none)
+        int32_t detail;        // SIMPLER_STALL_DETAIL_*
+        int32_t cnt_running;   // tasks observed RUNNING (on a core)
+        int32_t cnt_ready;     // fanin-satisfied but not dispatched
+        int32_t cnt_waiting;   // still waiting on fanin
+        int32_t completed;     // completed_tasks_ snapshot
+        int32_t total;         // total_tasks_ snapshot
+        int32_t orch_done;     // orchestrator_done flag (0/1)
+        TaskId stuck_task_id;  // S1: first RUNNING task's id, invalid() if none
+        int32_t stuck_core;    // S1: core hosting it (-1 if none)
     };
 
-    // Scan the rings once (same ground truth as log_stall_diagnostics: a slot is
+    // Scan the rings once (same ground truth as log_global_stall_diagnostics: a slot is
     // RUNNING iff a core holds it as running_slot_state) and reduce to a
     // StallClassification. Pure reads — safe to call from any scheduler thread.
     __attribute__((noinline, cold)) StallClassification classify_stall_reason() const;
@@ -545,12 +579,10 @@ private:
     // =========================================================================
 
     uint64_t get_function_bin_addr(int func_id) const {
-        if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+        if (!func_id_to_addr_ || func_id < 0 || static_cast<uint32_t>(func_id) >= func_id_to_addr_count_) {
+            LOG_ERROR("func_id=%d is out of range [0, %u) or the table is unbound", func_id, func_id_to_addr_count_);
             return 0;
         }
         return func_id_to_addr_[func_id];
     }
 };
-
-#endif  // SCHEDULER_CONTEXT_H

@@ -186,16 +186,16 @@ jobs:
             echo "All changes are a2a3-only or non-code; skipping a5"
           fi
 
-          # Test-category axis, same shape as the arch axis.
+          # Test-category axis. Repo-local tools are not used by scene tests.
           ST_ONLY='^(tests/st/|examples/)'
-          UT_ONLY='^tests/ut/'
+          UT_ONLY='^(tests/ut/|tools/)'
 
           ST_REMAINING=$(echo "$FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$ST_REMAINING" ]; then
             echo "st_affected=true" >> "$GITHUB_OUTPUT"
           else
             echo "st_affected=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are unit-test-only or non-code; skipping scene tests"
+            echo "All changes are unit-test/tooling-only or non-code; skipping scene tests"
           fi
 
           UT_REMAINING=$(echo "$FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)

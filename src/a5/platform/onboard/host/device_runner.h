@@ -23,6 +23,7 @@
 
 #include <runtime/rt.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +33,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+
+#include "host/run_progress_slots.h"
 #include <unordered_set>
 #include <vector>
 
@@ -73,6 +76,12 @@
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+    // #2267's retention probe. There is no stream pair here to retire — every
+    // run submits on the persistent bootstrap streams — so what the probe needs
+    // instead is the single-run poll slot, which a successor's launch takes
+    // over and no path restores.
+    friend class RunRetentionProbePeer;
+
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
@@ -82,7 +91,7 @@ public:
     // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`, `create_thread`,
     // `attach_current_thread`, `ensure_device_initialized`,
     // `print_handshake_results`, `set_executors`, `set_dispatcher_binary`,
-    // `device_id`, `last_device_wall_ns`, `launch_aicpu_kernel`, and
+    // `device_id`, `last_device_wall_ns`, `launch_aicpu_payload`, and
     // `launch_aicore_kernel` are inherited from `DeviceRunnerBase`.
 
     // The blocking entry point composes these operations. enqueue owns rollback
@@ -94,12 +103,24 @@ public:
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
-    int drain_execution(ActiveExecution &active) override;
+    DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
+
+    /**
+     * Whether a run may be ordered behind another on this runner right now.
+     *
+     * There is no stream ownership to wait for: every run submits on the two
+     * persistent bootstrap streams, which this runner holds for its lifetime.
+     * What does disqualify the runner is poison — a context that may not accept
+     * a new submission must not have ordering edges built into it either, and
+     * the boundary events such an edge would name are exactly the resources a
+     * poisoned runner has quarantined rather than proved retired.
+     */
+    bool ready_to_join_launch() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
-    // `output_prefix()`, and `launch_aicpu_kernel` live on
+    // `output_prefix()`, and `launch_aicpu_payload` live on
     // `DeviceRunnerBase`.
 
     /**
@@ -108,17 +129,19 @@ public:
      * instead of the device collector. Defined in the .cpp so this header stays
      * free of the runtime-provided capture symbols.
      */
-    void set_dep_gen_enabled(bool enable) override;
+    void arm_host_dep_gen_capture(bool enable) override;
+    void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
+    bool dep_gen_retains_runs() const override;
+    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
+    bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
+    void dep_gen_finish_retained() override;
 
     /**
-     * Cleanup all resources
-     *
-     * Frees all device memory, destroys streams, and resets state.
-     * Use this for final cleanup when no more tests will run.
-     *
-     * @return 0 on success, error code on failure
+     * a5 fills the per-core register table only: it has no ffts_base_addr
+     * field. The table is allocated on `mem_alloc_`.
      */
-    int finalize() override;
+    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
 
     // `upload_chip_callable_buffer`, `register_callable`,
     // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
@@ -162,8 +185,10 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    int finalize_impl() override;
+
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
-    // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
+    // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
     // binaries_loaded_) is inherited from `DeviceRunnerBase`.
@@ -205,21 +230,45 @@ private:
     // Admission and recovery execute on different host threads.
     std::atomic<bool> device_unusable_{false};
 
-    enum class RunPollState : uint8_t {
-        Idle,
-        Enqueuing,
-        Submitted,
-        DeviceComplete,
-        Drained,
-    };
-    std::atomic<RunPollState> run_poll_state_{RunPollState::Idle};
-    std::atomic<uint32_t> run_poll_slot_{PTO_PIPELINE_MAX_DEPTH};
+    // Where each run-resource set is in its run, and which run that is. Per set
+    // rather than per runner: with two runs launched a predecessor reaching
+    // `Drained` says nothing about a successor still executing. See
+    // `host/run_progress_slots.h` for the single-owner precondition the epoch
+    // check relies on.
+    RunProgressSlots run_progress_;
+
+protected:
+    /** The progress table holds one slot per run-resource set. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_progress = RunProgressSlots::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_progress_.commit(std::move(staged.run_progress));
+    }
+
+private:
+    // Queue this run's own AICore boundary into the AICPU stream, ahead of the
+    // AICPU boundary record that then covers the whole operator. The reservation
+    // is taken by the caller, so a refusal costs only joinability; this is the
+    // step that touches the stream, and its failure grades the run Partial.
+    int queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done);
+
+    // Order this run behind the whole-operator boundary of the predecessor its
+    // join names, on the AICore stream it submits first, and record the event
+    // that proves the wait consumed. Its AICPU side needs no edge: that stream
+    // already holds the predecessor's kernel and boundary record ahead of this
+    // run's payload, and it is one FIFO.
+    int queue_cross_run_wait(PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink);
 
     // Release execution-owned per-run resources. Idempotent so prepare rollback
-    // and drain share one path. `launched` publishes the sticky terminal poll
-    // state, which only a run that reached the streams may claim; the collectors
-    // are released either way, since prepare_execution() initialized them for
-    // this run alone.
+    // and drain share one path. `launched` publishes this set's terminal state,
+    // which only a run that reached the streams may claim. Discharges the queued
+    // waits naming this run's boundaries first, and reads the poison only after
+    // that, because the discharge is what may raise it. Collectors are not
+    // released here: their device resources belong to the worker's lifetime and
+    // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
     // On an AICore launch/sync error, best-effort drain the device so a later
@@ -253,7 +302,42 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_chip_swimlane(int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args);
+    /**
+     * Build this run's collector pools, profiling flag and device KernelArgs
+     * refresh, under the execution claim.
+     *
+     * The collectors are resident and shared by every run on this runner, and a
+     * run whose core / AICPU-thread counts differ from the pools' releases and
+     * rebuilds them. Neither is safe while another run is executing against
+     * them, which is why none of it happens during preparation.
+     */
+    int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
+
+    /**
+     * Commit this device's AICore register-address table on first use.
+     *
+     * Storage lives on DeviceRunnerBase and is released in finalize_common();
+     * only the driver query is arch-specific, which is why this is not a base
+     * method — a5 maps one register window per physical core, a2a3 two MMIO
+     * pages selected by an AicoreRegKind.
+     *
+     * Guarded on the committed flag rather than the address: a failed
+     * host-to-device copy whose rollback release also failed retains the address
+     * for teardown, and that block is owned but unwritten. The retained address
+     * is passed back in, which is what lets the driver entry reuse the block
+     * instead of stranding it.
+     *
+     * Failure propagates. The AICPU handshake and the AICore PMU base both
+     * dereference these addresses, so handing the device an uncommitted table
+     * would deadlock the next task on a stream-sync timeout rather than fail the
+     * prepare (see host_regs.cpp).
+     */
+    int ensure_aicore_reg_table();
+
+    int init_chip_swimlane(
+        int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+        ChipSwimlaneLevel chip_swimlane_level
+    );
 
     /**
      * Initialize args dump device buffers.
@@ -263,7 +347,8 @@ private:
      * @param device_id Device ID for allocations
      * @return 0 on success, error code on failure
      */
-    int init_args_dump(Runtime &runtime, int device_id, KernelArgsHelper &kernel_args);
+    int
+    init_args_dump(const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level);
 
     /**
      * Initialize PMU profiling device buffers.
@@ -277,7 +362,6 @@ private:
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
     //
     // dep_gen enablement is a5-specific (a2a3 carries its own copy).
-    bool enable_dep_gen_{false};
 
     int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out);
     int query_aicpu_topology(pto::a5::AicpuTopology &out);
@@ -291,10 +375,7 @@ private:
     bool aicpu_topology_cached_{false};
     pto::a5::AicpuTopology aicpu_topology_{};
 
-    int init_pmu(
-        int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id,
-        KernelArgsHelper &kernel_args
-    );
+    int init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args);
     int init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
     /**
@@ -306,9 +387,31 @@ private:
      */
     int init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
+    // Emit the device-orchestration dep_gen graph, on both the success and the
+    // error return of drain_execution: the device flushes its dep_gen buffers
+    // during emergency_shutdown, so a failed run's graph is recoverable. Its own
+    // reconcile is the completeness gate — see the definition.
+    /**
+     * Emit this run's dependency graph.
+     *
+     * `device_execution_complete` is the caller's own fence observation and the
+     * whole of the completion proof: without it the retained path reads nothing
+     * shared and publishes nothing.
+     */
+    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+
     // Per-run collector teardown: stops mgmt + poll threads on every collector
     // whose init succeeded, in the only safe order (stop() joins mgmt before
     // poll). Idempotent — collectors that never initialized are skipped.
     // Does not release device memory; full release happens in finalize().
-    void finalize_collectors(bool abandon_device_resources = false);
+    /**
+     * Release the diagnostics collectors' shared memory.
+     *
+     * Returns non-zero when a collector's own finalize reported a failure —
+     * today only retained ArgsDump, whose last host sealing happens there,
+     * after the caller's diagnostic flush has already run. A caller folds this
+     * into its own rc only where no device error has been recorded: a device
+     * failure is the more useful diagnosis and keeps priority.
+     */
+    int finalize_collectors(bool abandon_device_resources = false);
 };

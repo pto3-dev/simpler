@@ -33,7 +33,7 @@ The `host_build_graph` runtime runs orchestration on the host, transfers the
 prepared image to the AICPU, and runs scheduling there. The
 `tensormap_and_ringbuffer` runtime runs both orchestration and scheduling on the
 AICPU. On a fatal condition the runtime **latches** a code, which the host reads
-back in `validate_runtime_impl` to print the lines above. Where it is latched
+back in `copy_back_run_outputs_impl` to print the lines above. Where it is latched
 follows where the reporter runs: a scheduler code goes into the shared-memory
 header, and so does an orchestrator code under `tensormap_and_ringbuffer`, whose
 orchestrator is on the AICPU. `host_build_graph`'s orchestrator is host-side, so
@@ -88,7 +88,7 @@ So on hardware the exception code is the *least* informative thing on screen. Th
 The description and remedy come from the log. What it cannot tell you is which
 layer to go looking in, which is what these columns are for.
 
-### Orchestration errors (1-11)
+### Orchestration errors (1-12)
 
 | Code | Name | Whose bug, usually |
 | ---- | ---- | ------------------ |
@@ -103,6 +103,7 @@ layer to go looking in, which is what these columns are for.
 | 9 | EXPLICIT_ORCH_FATAL | orchestration (deliberate) |
 | 10 | SCOPE_TASKS_OVERFLOW | runtime-internal |
 | 11 | TENSORMAP_OVERFLOW | runtime-internal / extreme scale |
+| 12 | SUBMIT_CAPACITY_EXCEEDED | orchestration / config (HBG only) |
 
 ### Scheduler errors (100+)
 
@@ -133,7 +134,7 @@ verdict plus locators, so you rarely need the device log:
 
 ```text
 [ERROR] scheduler timeout sub_class=S1:running-stalled (detail=1) completed=0/1 \
-        running=1 ready=0 waiting=0 orch_done=1 stuck_task_id=42 stuck_core=5
+        running=1 ready=0 waiting=0 orch_done=1 stuck_task_id=0x0000000100000001 stuck_core=5
 ```
 
 | Sub-class | Cause |
@@ -180,7 +181,7 @@ always *fallout* — scroll up for the first failure on that device. For classif
 
 | You have | Go to |
 | -------- | ----- |
-| a capacity code — 1, 2, 3, 4, 11 | [Capacity](device-error-codes/capacity.md) |
+| a capacity code — 1, 2, 3, 4, 11, 12 | [Capacity](device-error-codes/capacity.md) |
 | a stall — 100, or code 8 | [Stalls](device-error-codes/stall.md) |
 | a `VEC`/`CUBE` instruction error or UB out of bounds in the device log | [AICore faults](device-error-codes/aicore-fault.md) |
 | 10, 11, 103, S4, S5 or unknown | [Codes with no end-to-end test](device-error-codes/untested.md) — and it is a runtime bug |
@@ -215,7 +216,7 @@ enforces coverage. Edit those and the log carries the new code correctly:
 | runtime code names / descriptions / hints | `src/common/runtime_status/error_names.h` |
 | host-side CANN names / descriptions / hints | `src/common/platform/include/host/acl_error_names.h` |
 | `SCHEDULER_TIMEOUT` sub-class labels | `src/common/host_build_graph/runtime_status.h`, `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h` |
-| completeness test | `tests/ut/cpp/common/test_error_code_names.cpp` |
+| completeness test | `tests/ut/cpp/common/runtime_status/test_error_code_names.cpp` |
 
 **This page does not need updating for a new code** — deliberately. The tables
 above carry only the triage column and the CANN names, neither of which the log
@@ -226,7 +227,7 @@ time, so there is nothing to drift out of sync.
 
 - Code definitions: `src/common/host_build_graph/runtime_status.h`,
   `src/{arch}/runtime/tensormap_and_ringbuffer/common/runtime_status.h`
-- Host print site: `.../host/runtime_maker.cpp` (`validate_runtime_impl`)
+- Host print site: `.../host/runtime_maker.cpp` (`copy_back_run_outputs_impl`)
 - Sub-class logic: `.../runtime/scheduler/scheduler_cold_path.cpp` (`classify_stall_reason`)
 - End-to-end negative tests: `tests/st/runtime_fatal_codes/`
 - Onboard `507018` mechanism triage + device logs: [`running-onboard.md`](../../.claude/rules/running-onboard.md)

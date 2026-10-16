@@ -21,6 +21,7 @@
 #define PLATFORM_A5_AICORE_INNER_KERNEL_H_
 
 #include <cstdint>
+#include "aicore_teardown.h"
 
 #include "common/platform_config.h"
 
@@ -35,14 +36,26 @@
 // SPIN_WAIT_HINT - no-op on real hardware (AICore has dedicated polling support)
 #define SPIN_WAIT_HINT() ((void)0)
 
-// OUT_OF_ORDER_STORE_BARRIER - no-op on real hardware (dcci handles cache coherency)
-#define OUT_OF_ORDER_STORE_BARRIER() ((void)0)
+// A kernel's output dcci issues a write-back; it does not wait for one. The task
+// reports FIN right after, and a consumer that observes FIN then reads that
+// output, so the flush has to have completed first. pto-isa documents the pair
+// for this chip family and the runtime already pairs dsb with its own flushes
+// when it publishes completion data (runtime/async_kernel_api.h).
+#define OUT_OF_ORDER_STORE_BARRIER() dsb(DSB_DDR)
 
 // OUT_OF_ORDER_LOAD_BARRIER - no-op on real hardware (dcci handles cache coherency)
 #define OUT_OF_ORDER_LOAD_BARRIER() ((void)0)
 
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
+
+// EXITED acknowledges quiescence; only the AICPU's post-close gate permits return.
+__aicore__ inline void wait_for_post_close_release(__gm__ uint32_t *release) {
+    while (static_cast<uint32_t>(ld_dev(release, 0)) != AICORE_POST_CLOSE_RELEASE) {
+        SPIN_WAIT_HINT();
+    }
+    dsb(DSB_DDR);
+}
 
 /**
  * Read an AICore register via SPR access
@@ -65,6 +78,14 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
         // pmu_collector_aicore.h. This single-arg SPR form only covers
         // DATA_MAIN_BASE / CTRL / COND.
         return 0;
+    }
+}
+
+// Resident startup can fail before AICPU has reset this run's return gate.
+// Only its DMB EXIT, published after that reset, permits the EXITED ACK.
+__aicore__ inline void wait_for_aicpu_exit_signal() {
+    while (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
+        SPIN_WAIT_HINT();
     }
 }
 
@@ -110,6 +131,8 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
  * @return Physical core ID (masked to 12 bits)
  */
 __aicore__ inline uint32_t get_physical_core_id() { return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK; }
+
+__aicore__ inline uint64_t platform_ssbuf_hardware_base_address() { return 0; }
 
 // =============================================================================
 // System Counter

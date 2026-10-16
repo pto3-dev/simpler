@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "graph_image_view.h"
 #include "assert_compat.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -25,12 +26,8 @@
 // runtime.h cannot be included here — it pulls in Handshake, which this header
 // only forward-declares. RUNTIME_MAX_WORKER therefore reaches the same platform
 // core count runtime.h defines it from, so both spellings carry one value.
-// RUNTIME_MAX_FUNC_ID has no platform-level source and stays a mirrored literal.
 #ifndef RUNTIME_MAX_WORKER
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
-#endif
-#ifndef RUNTIME_MAX_FUNC_ID
-#define RUNTIME_MAX_FUNC_ID 1024
 #endif
 
 // Forward declarations — avoid pulling in full headers for pointer/reference params.
@@ -150,10 +147,10 @@ public:
     // host_build_graph always reserves it (aicpu_thread_num >= 2 is required).
     int32_t p_thread_idx() const { return p_thread_idx_; }
 
-    // Shutdown AICore registers for this thread's assigned cores.
-    // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
-    // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
-    int32_t shutdown(int32_t thread_idx);
+    // Retire the cores this thread owns, on its way out of resolve_and_dispatch.
+    // Threads that own none no-op. Runs before the completion latch, so no
+    // run() exit path can leave a worker blocked on its gate.
+    int32_t shutdown(int32_t thread_idx, Runtime *runtime);
 
     // Run all post-attach scheduler bookkeeping, once, on the boot leader:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -169,7 +166,7 @@ public:
     // on_graph_attached and before runtime_init_ready_ (the caller barriers
     // all threads between the two). Concurrency-safe: push_ready_routed and
     // register_wake are the same lock-free primitives used during the run.
-    void classify_partition(int32_t thread_idx, int32_t nthreads);
+    void classify_partition(int32_t thread_idx, int32_t nthreads, const GraphImageView &image);
 
     // Bind the RuntimeContext scheduler pointer.
     void bind_runtime(RuntimeContext *rt);
@@ -199,6 +196,19 @@ private:
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
 
+    // early_dispatch_shape's batch-pop scratch, one set per scheduler thread. The
+    // two arrays are indexed in lockstep: task_id_snapshots[i] is the tag batch[i]
+    // was queued with. Pure scratch -- pop_batch_tagged writes every element a
+    // later read touches, so nothing here carries meaning across calls or runs and
+    // deinit() leaves it alone. It lives here rather than on that function's stack
+    // so the TaskId array's default construction is paid once, at construction,
+    // instead of on every dispatch attempt that finds a free core.
+    struct EarlyStagingScratch {
+        ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+        TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
+    };
+    EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
+
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.
     DispatchPayload payload_per_core_[RUNTIME_MAX_WORKER][2];
@@ -224,7 +234,20 @@ private:
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
     std::atomic<bool> completed_{false};
+    // READY publishes completed initialization, or an opened window on startup
+    // failure. REQUESTED retains an exit request before that publication. Only
+    // the operation adding the second bit owns the core's window and return gate.
+    // Indexed by core id and reset before handshake in each generation.
+    static constexpr uint8_t RETIREMENT_READY = 1;
+    static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
+    // The active callable's registration-owned object-address table and the
+    // number of entries it holds, both bound from the descriptor in the cold
+    // path. The table is in the callable's registration block, not in the
+    // descriptor, so the length is the only bound available here: an index past
+    // it is unmapped rather than in-range-and-zero.
     uint64_t *func_id_to_addr_{nullptr};
+    uint32_t func_id_to_addr_count_{0};
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
@@ -276,6 +299,13 @@ private:
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
+    // Request the named cores; an unpublished core is retired by its publisher.
+    // The second-bit winner alone reads execution state and manages the window.
+    int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_retirement_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_all_retirement_cores(Runtime *runtime);
+    int32_t retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    int32_t retire_all_cores(Runtime *runtime);
 
     __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);
 
@@ -536,8 +566,10 @@ private:
     __attribute__((noinline, cold)) LoopAction
     check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
 
-    __attribute__((noinline, cold)) void
-    log_stall_diagnostics(int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count);
+    __attribute__((noinline, cold)) void log_stall_diagnostics(
+        int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count,
+        StallDumpReport report
+    );
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
         int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
@@ -581,8 +613,8 @@ private:
     // =========================================================================
 
     uint64_t get_function_bin_addr(int func_id) const {
-        if (!func_id_to_addr_ || func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("func_id=%d is out of range [0, %d) or map is null", func_id, RUNTIME_MAX_FUNC_ID);
+        if (!func_id_to_addr_ || func_id < 0 || static_cast<uint32_t>(func_id) >= func_id_to_addr_count_) {
+            LOG_ERROR("func_id=%d is out of range [0, %u) or the table is unbound", func_id, func_id_to_addr_count_);
             return 0;
         }
         return func_id_to_addr_[func_id];

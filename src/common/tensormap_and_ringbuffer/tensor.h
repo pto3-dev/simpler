@@ -86,7 +86,7 @@ struct alignas(64) Tensor {
     DataType dtype;                    // Data type of tensor elements
     bool manual_dep;                   // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
     bool is_contiguous;                // Cached: strides[] == row_major_stride(shapes)
-    AddressSpace address_space;        // HOST (default) or DEVICE (child-managed device memory; skips H2D copy)
+    AddressSpace address_space;        // Physical location after argument binding
     uint32_t shapes[MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
 
     // === Cache line 2 (64B) — warm path (view metadata) ===
@@ -134,7 +134,7 @@ struct alignas(64) Tensor {
     }
 
     /// True when `buffer.addr` is a device pointer allocated by the child process
-    /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
+    /// (host skips the H2D copy-in for bind's arguments). Host-side concept carried
     /// across the wire; runtime views inherit it via the cache-line-1 copy.
     [[nodiscard]] bool is_device_memory() const { return address_space == AddressSpace::DEVICE; }
 
@@ -160,7 +160,7 @@ struct alignas(64) Tensor {
     /// Enforces the ndims > 0 invariant relied upon by every downstream op.
     void init_external(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        int32_t in_version, bool in_manual_dep = false, AddressSpace in_address_space = AddressSpace::HOST
+        int32_t in_version, bool in_manual_dep = false, AddressSpace in_address_space = AddressSpace::DEVICE
     ) {
         always_assert(in_ndims > 0 && in_ndims <= MAX_TENSOR_DIMS);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
@@ -419,6 +419,8 @@ struct alignas(64) Tensor {
     }
 
     /// The boundary form of this tensor: geometry and resolved address only.
+    // This conversion exports geometry and address only; it does not reconstruct a
+    // submission request. A new invocation supplies its own transfer policy.
     ChipTensor to_boundary() const {
         ChipTensor arg{};
         arg.buffer = buffer;
@@ -470,7 +472,7 @@ private:
     // default constructor is public — see above — for POD/array storage.)
     Tensor(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        int32_t in_version, bool in_manual_dep = false, AddressSpace in_address_space = AddressSpace::HOST
+        int32_t in_version, bool in_manual_dep = false, AddressSpace in_address_space = AddressSpace::DEVICE
     ) {
         init_external(
             addr, buffer_size_bytes, in_shapes, in_ndims, in_dtype, in_version, in_manual_dep, in_address_space
@@ -534,7 +536,7 @@ static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 
 // =============================================================================
 inline Tensor make_tensor_external(
     void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
-    int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
+    int32_t version = 0, AddressSpace address_space = AddressSpace::DEVICE
 ) {
     uint64_t total = 1;
     for (uint32_t i = 0; i < ndims; i++) {
@@ -552,7 +554,7 @@ inline Tensor make_tensor_external(
 // =============================================================================
 inline Tensor make_tensor_strided(
     void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false, int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
+    bool manual_dep = false, int32_t version = 0, AddressSpace address_space = AddressSpace::DEVICE
 ) {
     always_assert(ndims > 0 && ndims <= MAX_TENSOR_DIMS);
     Tensor t{};

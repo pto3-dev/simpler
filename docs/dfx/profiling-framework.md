@@ -51,9 +51,9 @@ Each profiling subsystem needs the same plumbing on the host:
 The AICPU producer side has a matching repeated shape: wait for ready-queue
 space, publish a full buffer, wait for a free replacement, and install it as the
 current buffer. Both waits are resident block-on-contention gates — the writer
-parks until the host clears the freeze — not bounded drops; records are only
-lost if the 30-second host-crash backstop trips. See
-[dfx/global-backpressure-design.md](global-backpressure-design.md).
+spins on its own queue until the host drains it (ready queue) or refills it (free
+queue), with no peer lane involved — not bounded drops; records are only lost if
+the 30-second backstop trips. See [dfx/backpressure-design.md](backpressure-design.md).
 
 Before unification this was near-identical control flow repeated across
 collectors. The framework collapses the host side to one implementation
@@ -166,13 +166,17 @@ Provides:
   shared-memory region; they refresh only their queue indices / entries
   before advancing `queue_heads`. On an empty scan, split drain does a short
   busy-poll window before falling back to the 10 us sleep, so a lane parked at
-  a buffer-switch gate is released promptly instead of riding out the freeze.
+  a buffer-switch gate is released promptly. A lane whose refill came up short
+  is retried after every sweep, since a starved lane has nothing left to
+  publish and so cannot trigger its own entry-driven top-up.
 - Optional collector sharding (`Module::kMaxCollectorThreads` caps the shard
   arrays; the live shard count is the runtime `min(aicpu_thread_num,
   kMaxCollectorThreads)`) — each collector drains one host ready shard and
   returns finished buffers through the matching done shard.
-- `poll_and_collect_loop` — per-shard `wait_pop_ready` with a 100 ms cv
-  tick, dispatches to `Derived::on_buffer_collected`, then calls
+- `poll_and_collect_loop` — per-shard `wait_pop_ready`; ready buffers and
+  lifecycle control requests wake it immediately, while a 100 ms cv tick is a
+  fallback for data-path notification loss and idle bookkeeping. It dispatches
+  to `Derived::on_buffer_collected`, then calls
   `manager_.notify_copy_done(...)` itself; its idle-timeout detector reports
   stalled traffic but keeps the consumer alive until execution completes.
 - `set_memory_context` / `clear_memory_context` so `Derived::init` can
@@ -183,16 +187,33 @@ Provides:
 [profiler_base.h](../../src/common/platform/include/host/profiler_base.h))
 is where the unified algorithms live:
 
-- `try_pop_aicpu_entry` — barrier-correct head/tail advance over the
-  per-thread ready queue, with a range-check guard against device-side
-  corruption.
-- `process_entry` — resolve/copy the popped buffer, refill the originating
-  free queue only from the current drain shard's local recycled lane, then
-  push to the host ready shard. Runtime drain does not allocate and does not
-  consume done shards directly. If the host ready shard is full, the drain
-  thread retains the buffer and waits until its collector frees a slot. This
-  makes the device-ready pop to host-ready push a lossless hand-off while
-  keeping the done shard's producer side collector-only.
+- `try_peek_aicpu_entry` / `ack_aicpu_entry` — barrier-correct read of the
+  per-thread ready queue's head entry and, separately, the head advance that
+  hands its slot back to the device, both with a range-check guard against
+  device-side corruption.
+- `process_entry` — resolve/copy the peeked buffer, acknowledge the device
+  slot, refill the originating free queue only from the current drain shard's
+  local recycled lane, then push to the host ready shard. Runtime drain does not
+  allocate and does not consume done shards directly. If the host ready shard is
+  full, the drain thread retains the buffer and waits until its collector frees a
+  slot. This makes the device-ready read to host-ready push a lossless hand-off
+  while keeping the done shard's producer side collector-only.
+
+  The acknowledgement sits after the copy on purpose: until it happens the
+  device still owns the slot, so a failed resolve or a failed device→host copy
+  costs a retry on the next sweep instead of the record. An entry that can never
+  be delivered — indices that do not validate, a buffer this manager never
+  mapped, or a copy still failing after `kStalledDrainEntryTimeout` — is
+  acknowledged so the queue keeps draining, counted in
+  `ProfilerBase::drain_dropped_buffers()` so `reconcile_counters()` can name it
+  rather than leaving an anonymous `silent_loss`, and its buffer is put back
+  where the pool can use it again: into the free_queue it came from, or into
+  `retired_[q][kind]` when that queue is already at `kSlotCount` — the same
+  fallback a short top-up takes (§4). An entry whose *indices* did not validate
+  is the exception, because its buffer pointer arrived in the same corrupt
+  entry: that pointer is never published into a device-visible free_queue, only
+  parked in the retired pool when the manager can map it to a block it owns, and
+  withheld entirely when it cannot.
 - `proactive_replenish` — before worker threads start, top every
   (kind, instance) free queue up to `kSlotCount` and optionally warm
   recycled lanes. If recycled is dry while filling free queues it
@@ -277,15 +298,17 @@ schema, flush/finalize behavior, and small layout hooks locally.
 
 The engine currently provides:
 
-- `wait_for_ready_queue_space` — block-on-contention park for a per-thread
-  ready-queue slot (push gate): raises `rq_contended` and holds until the host
-  clears `rq_freeze_active`, bounded only by the 30 s host-crash backstop.
-- `wait_for_free_queue_entry` — block-on-contention park for a replacement
-  buffer in a free queue (pop gate): raises `fq_contended` and holds until the
-  host clears `fq_freeze_active`, with acquire ordering before reading
-  `buffer_ptrs[]`.
+- `wait_for_ready_queue_space` — block-on-contention spin for a per-thread
+  ready-queue slot (push gate): holds until the drain shard serving that queue
+  advances its head, bounded only by the 30 s host-crash backstop.
+- `wait_for_free_queue_entry` — block-on-contention spin for a replacement
+  buffer in a free queue (pop gate): holds until that lane's own drain shard
+  publishes one, with acquire ordering before reading `buffer_ptrs[]`. One
+  timeout budget spans the whole wait, so a permanently short pool reports a
+  drop instead of spinning forever.
 - `enqueue_ready` — write the ready entry, `wmb()`, then advance
-  `queue_tails[q]`.
+  `queue_tails[q]`. Publication and success are atomic: the gate runs entirely
+  before the tail advances.
 - `pop_free` — pop a free buffer, clear its count, install
   `current_buf_ptr/current_buf_seq`, update any local cache hook, then
   publish with `wmb()`.
@@ -322,10 +345,12 @@ Current users:
 ```text
   AICPU                       mgmt thread(s)                    collector shard(s)
   ─────                       ──────────────                    ──────────────────
-  write record into         try_pop_aicpu_entry(q)
+  write record into         try_peek_aicpu_entry(q)
   current free buffer       ──────────────────────────►
                             process_entry:
                               resolve_host_ptr
+                              copy buffer from device
+                              ack_aicpu_entry(q)
                               pop recycled[q]
                                 (top up originating free_queue)
                               wait_push_to_ready(shard q) ────► wait_pop_ready(q)
@@ -348,7 +373,8 @@ its matching collector and drained by the replenish thread. A completed
 buffer first fills the largest same-kind recycled deficit; when no shard is
 below its target, it returns to its origin shard. Split drain refills the
 originating free queue on the hot path from `recycled[q]`; replenish does not
-write free queues at runtime. Backpressure fallbacks that cannot publish a
+write free queues at runtime, which makes each free queue single-writer by
+structure. Backpressure fallbacks that cannot publish a
 buffer to ready/free/recycled place it in `retired_[q][kind]`, which is outside
 the hot SPSC path and is released at teardown.
 
@@ -376,6 +402,7 @@ the hot SPSC path and is released at teardown.
     join mgmt thread(s)     ← drain final-pass flushes the last entries into
                               ready shards before exiting
     execution_complete_ = true
+    notify ready waiters     ← lifecycle control does not wait for the cv tick
     join collector thread(s)← each shard drains once more, then exits
 
   Derived::finalize(unregister, free)
@@ -406,7 +433,7 @@ mid-run by the framework.
 | `done_shards_[q]` | replenish | collector q | fixed-capacity SPSC ring |
 | `recycled_[shard][kind]` | drain shard at runtime | replenish | fixed-capacity SPSC ring; startup code may pop any shard before threads start |
 | `retired_[shard][kind]` | teardown | exceptional fallback paths | mutex-protected holding pool; not used by the hot recycle path |
-| `dev_to_host_` / block ranges | mgmt (`resolve_host_ptr`) | init/startup allocation | `mapping_mutex_`; collector touches it only in `release_owned_buffers` / `clear_mappings`, after `stop()` has joined mgmt |
+| `dev_to_host_` / block ranges | drain shards (`resolve_host_ptr`) | init/startup allocation, runtime replenish, teardown | shared `mapping_mutex_` for resolution; exclusive `mapping_mutex_` for mutation |
 | `MemoryOps` / `shared_mem_host_` / `device_id_` | both threads | start-only | `set_memory_context` is called once before threads spawn; read-only afterwards |
 | AICPU per-thread ready queues (`header->queues[q]`) | mgmt (head advance) | AICPU (tail advance) | `read_range_from_device` in split drain, then `write_range_to_device` for `queue_heads[q]` |
 | Per-instance `FreeQueue` | AICPU (head advance) | owning drain shard (tail advance) | SPSC ownership; host refreshes `head` before writing `buffer_ptrs[]` / `tail` |
@@ -419,12 +446,14 @@ Two things follow:
   remains its lane's only consumer.
 - Device-side queue backpressure is resident block-on-contention for the
   profiling writers that use this protocol: on a full ready queue or empty free
-  queue the AICPU writer parks at its buffer-switch gate and loses no records
-  until the host clears the freeze. There is no opt-out and no short-wait drop;
-  the only bound is the 30-second host-crash backstop
+  queue the AICPU writer spins at its buffer-switch gate and loses no records
+  until the host drains or refills that lane's queue. Recovery is per-lane, so
+  no peer lane stops. There is no opt-out and no short-wait drop; the only bound
+  is the 30-second backstop
   (`PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES`), and a record is dropped only if
-  that trips — i.e. the host is gone. Full state machine and its correctness
-  arguments: [dfx/global-backpressure-design.md](global-backpressure-design.md).
+  that trips — i.e. the host made no progress on that queue for the whole budget.
+  Full design and its correctness
+  arguments: [dfx/backpressure-design.md](backpressure-design.md).
 - The AICPU writer publishes a full buffer to the ready queue before
   acquiring its replacement buffer. If no replacement is visible yet, the
   current pointer is cleared and later records first try to recover from

@@ -16,8 +16,8 @@ the task argument users build — from ``simpler.buffer``. Torch-aware helpers
 this module has no torch dependency.
 
 ``ChipTensor`` is the chip-only POD the runtime ABI expects, paired with
-``ChipStorageTaskArgs`` on the direct ``ChipWorker`` path; it carries a
-materialized address and never crosses a process boundary.
+``ChipStorageTaskArgs`` internally and at the legacy ``ChipWorker`` boundary;
+it carries a materialized address and never crosses a process boundary.
 
 Usage:
     from simpler.task_interface import DataType, TaskArgs, Tensor, TensorArgType
@@ -26,9 +26,13 @@ Usage:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
+import os
+import shutil
 import sys
+import tempfile
 import threading
 import uuid
 import weakref
@@ -42,18 +46,32 @@ if TYPE_CHECKING:
     # Annotation-only: `CallableHandle` is imported lazily at its use site, and
     # PEP 563 keeps these annotations as strings, so nothing is imported at
     # runtime.
+    from simpler_setup.runtime_builder import RuntimeBinaries
+
     from .callable_identity import CallableHandle
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
+    MAILBOX_REQUEST_FRAME_OFFSETS,
+    MAILBOX_REQUEST_FRAMES,
+    MAILBOX_RUN_ENTRY_OFFSETS,
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
+    PROV_DESCRIPTOR_MISMATCH,
+    PROV_NOT_LIVE,
+    SIMPLER_TEARDOWN_REPORT_BYTES,
+    TEARDOWN_REPORT_SCHEMA,
     ArgDirection,
     CallConfig,
     ChipCallable,
@@ -62,6 +80,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
+    ExecutionContextRefused,
+    ProvenanceTable,
     RuntimeEnv,
     TaskArgs,
     TaskHandle,
@@ -73,6 +93,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     arg_direction_name,
     get_dtype_name,
     get_element_size,
+    mailbox_run_entry_count,
+    mailbox_size,
     read_args_from_blob,
 )
 from _task_interface import (
@@ -94,10 +116,35 @@ from _task_interface import (
     _initialize_host_log as _native_initialize_host_log,
 )
 from _task_interface import (
+    _set_host_log_directory as _native_set_host_log_directory,
+)
+from _task_interface import (
     _start_host_log_writer as _native_start_host_log_writer,
 )
+from _task_interface import (
+    scalar_to_uint64 as _native_scalar_to_uint64,
+)
 
-from .buffer import Buffer, Tensor
+from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
+from .comm_endpoints import DEVICE_AICPU
+
+
+def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -> None:
+    """Check callable-side host access before descriptors become address-only PODs."""
+    for i in range(args.tensor_count()):
+        buffer = args.tensor(i).buffer
+        if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
+            continue
+        direction = target.sig(i) if target is not None and i < target.sig_count else None
+        needed = {
+            ArgDirection.IN: AccessMode.READ,
+            ArgDirection.OUT: AccessMode.WRITE,
+            ArgDirection.INOUT: AccessMode.READWRITE,
+        }.get(direction)
+        # Wire TaskArgs do not carry dependency tags. The callable signature governs
+        # actual host reads/writes, so a weaker caller tag cannot widen the grant.
+        if needed is None or buffer.access not in (needed, AccessMode.READWRITE):
+            raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -169,6 +216,7 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 __all__ = [
     "DataType",
     "DeviceMemoryInfo",
+    "ExecutionContextRefused",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
@@ -176,6 +224,7 @@ __all__ = [
     "ChipTensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
+    "TensorTransfer",
     "TaskArgs",
     "TaskHandle",
     "RemoteAddressSpace",
@@ -193,13 +242,28 @@ __all__ = [
     # Distributed runtime
     "WorkerType",
     "TaskState",
+    "ProvenanceTable",
+    "PROV_NOT_LIVE",
+    "PROV_DESCRIPTOR_MISMATCH",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_REQUEST_FRAMES",
+    "MAILBOX_REQUEST_FRAME_OFFSETS",
+    "MAILBOX_RUN_ENTRY_OFFSETS",
+    "MAILBOX_RUN_ENTRY_STRIDE",
+    "MAILBOX_RUN_ENTRY_TABLE_OFFSET",
+    "mailbox_size",
+    "mailbox_run_entry_count",
     "MAILBOX_FRAME_SIZE",
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
     "MAILBOX_STATE_VALUES",
     "MAILBOX_PREPARATION_DISPOSITION_VALUES",
+    "MAILBOX_ARGS_CAPACITY",
+    "MAILBOX_OFF_TEARDOWN_REPORT",
+    "MAILBOX_TASK_PROTOCOL_VERSION",
+    "SIMPLER_TEARDOWN_REPORT_BYTES",
+    "TEARDOWN_REPORT_SCHEMA",
     "read_args_from_blob",
     # Dynamic CommDomain allocation (orch-only API)
     "CommBufferSpec",
@@ -799,15 +863,26 @@ def _sidecar_from_ref(storage: _RemoteTaskArgsStorage, ref: RemoteTensorRef) -> 
 
 
 def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
+    """``args``' sidecar storage, extended to cover every arg added so far.
+
+    ``sidecars`` is indexed by arg position and covers a prefix of the list: a local arg names no
+    remote memory, so it occupies a ``None`` slot, and the positions past the last remote ref carry
+    no slot at all. The caller appends this ref's own sidecar after adding its placeholder, so
+    padding here is what puts that append at the placeholder's index.
+    """
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
-        if storage is None or len(storage.sidecars) != args.tensor_count():
-            storage = _RemoteTaskArgsStorage([None for _ in range(args.tensor_count())], bytearray())
+        if storage is None:
+            storage = _RemoteTaskArgsStorage([], bytearray())
             _REMOTE_TASK_ARGS_STORAGE[args] = storage
+        while len(storage.sidecars) < args.tensor_count():
+            storage.sidecars.append(None)
         return storage
 
 
-def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT) -> None:
+def _task_args_add_tensor(
+    self: TaskArgs, tensor, tag: TensorArgType = TensorArgType.INPUT, *, transfer: TensorTransfer | None = None
+) -> None:
     """Add a task arg. ``tensor`` is a ``simpler.buffer.Tensor`` (packable) or its packed
     bytes. A RemoteTensorRef (arg destined for a remote worker) is rewritten to a REMOTE_SIDECAR
     ``Tensor`` (no local backing) with its remote descriptor tracked in the sidecar."""
@@ -833,14 +908,10 @@ def _task_args_add_tensor(self: TaskArgs, tensor, tag: TensorArgType = TensorArg
             ),
             byte_offset=int(tensor.offset),
         )
-        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag)
+        _TASK_ARGS_ADD_TENSOR(self, placeholder, tag, transfer=transfer)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
-    _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
-    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
-        storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
-        if storage is not None:
-            storage.sidecars.append(None)
+    _TASK_ARGS_ADD_TENSOR(self, tensor, tag, transfer=transfer)
 
 
 def _task_args_clear(self: TaskArgs) -> None:
@@ -867,10 +938,14 @@ def _remote_sidecar_for(args: TaskArgs) -> _RemoteTaskArgsSidecar | None:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
         if storage is None:
             return None
-        if len(storage.sidecars) != args.tensor_count():
+        # The wire form is one slot per arg; local args added after the last remote ref are the
+        # tail `sidecars` does not reach. More slots than args is storage for a different arg list.
+        missing = args.tensor_count() - len(storage.sidecars)
+        if missing < 0:
             _REMOTE_TASK_ARGS_STORAGE.pop(args, None)
             return None
-        return _RemoteTaskArgsSidecar(tuple(storage.sidecars), bytes(storage.inline_payload))
+        tensors = tuple(storage.sidecars) + (None,) * missing
+        return _RemoteTaskArgsSidecar(tensors, bytes(storage.inline_payload))
 
 
 def _remote_access_label(flags: int) -> str:
@@ -942,26 +1017,46 @@ assert ctypes.sizeof(_CommContextStruct) == 1056
 def scalar_to_uint64(value) -> int:
     """Convert a scalar value to ``uint64``.
 
-    *value* can be a Python int, float, a ctypes scalar (``c_int64``,
-    ``c_float``, etc.), or any object convertible to ``int``.
+    *value* can be a Python int, float, bool, a numpy integer scalar, an
+    ``IntEnum`` member, or a ctypes scalar.
 
-    Python float values are converted to IEEE 754 single precision (32-bit)
-    and their bit pattern is zero-extended to uint64. This may cause a loss of
-    precision. For double precision, use ``ctypes.c_double``.
+    The accepted ctypes types are the integer widths (``c_int8`` ..
+    ``c_uint64``), ``c_float``, ``c_double`` and ``c_bool``, and any subclass
+    of one of them. A pointer or character type (``c_void_p``, ``c_char_p``,
+    ``c_char``, ``c_wchar``) is refused: its buffer holds an address or a
+    character rather than a number a slot can carry.
+
+    A byte-order-qualified variant (``c_uint32.__ctype_be__`` on a
+    little-endian host, and its ``__ctype_le__`` counterpart on a big-endian
+    one) is also refused. Its bytes are stored in the opposite order, so
+    copying them would encode a different number than the same value written
+    from orchestration, and ``to_u64`` has no reversed-order form to agree
+    with.
+
+    The encoding matches C++ ``to_u64()`` bit for bit, so a slot written from
+    Python and one written from orchestration read back identically.
+
+    A ctypes scalar is read at its own width and **zero-extended**, never
+    sign-extended: ``c_int8(-1)`` is ``0xFF``, matching ``to_u64(int8_t{-1})``.
+    Reading it back with the matching width (``scalar<int8_t>``) still yields
+    ``-1``.
+
+    Python float values (and ``numpy.float64``, which is itself a ``float``
+    subclass) are converted to IEEE 754 single precision (32-bit) and their
+    bit pattern is zero-extended to uint64. This may cause a loss of
+    precision. A finite value outside single-precision range (``1e100``)
+    raises rather than being stored as an infinity; ``inf`` and ``nan`` pass
+    through as themselves. For double precision, use ``ctypes.c_double`` -- a
+    bare Python float carries no width, so this is the one encoding that
+    cannot align with its C++ counterpart, where ``to_u64(1.5)`` is a double.
+    A narrower numpy float (e.g. ``numpy.float32``) is rejected rather than
+    silently coerced through ``int()`` -- wrap it in ``float(...)`` first if
+    that narrowing is what you want.
+
+    An integer outside the 64-bit two's-complement range raises rather than
+    truncating to its low 64 bits.
     """
-    import struct as _struct
-
-    if isinstance(value, float):
-        bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
-        return bits
-    import ctypes as _ct
-
-    if isinstance(value, _ct._SimpleCData):
-        if isinstance(value, (_ct.c_float, _ct.c_double)):
-            uint_type = _ct.c_uint32 if isinstance(value, _ct.c_float) else _ct.c_uint64
-            return uint_type.from_buffer_copy(value).value
-        return int(value.value) & 0xFFFFFFFFFFFFFFFF
-    return int(value) & 0xFFFFFFFFFFFFFFFF
+    return _native_scalar_to_uint64(value)
 
 
 @dataclass
@@ -1254,6 +1349,38 @@ class GlobalCommDomainView:
         return self._committed
 
 
+_HOST_LOG_SESSION_OWNER_PID = os.getpid()
+_HOST_LOG_SESSION_DIRECTORY = Path(tempfile.gettempdir()) / (
+    f"simpler-host-logs-{_HOST_LOG_SESSION_OWNER_PID}-{uuid.uuid4().hex}"
+)
+
+
+def _bind_host_log_session_directory() -> str:
+    """Bind the process tree to one log directory that outlives every capture."""
+    bound = _native_host_log_directory()
+    if bound:
+        return str(bound)
+    _HOST_LOG_SESSION_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _native_set_host_log_directory(str(_HOST_LOG_SESSION_DIRECTORY))
+    bound = _native_host_log_directory()
+    if not bound:
+        raise RuntimeError(f"cannot bind simpler Host log directory {_HOST_LOG_SESSION_DIRECTORY}")
+    return str(bound)
+
+
+def _cleanup_host_log_session_directory() -> None:
+    """Remove the transient spool at normal owner-process exit."""
+    if os.getpid() != _HOST_LOG_SESSION_OWNER_PID:
+        return
+    with contextlib.suppress(BaseException):
+        _native_flush_host_log(1000)
+    with contextlib.suppress(OSError):
+        shutil.rmtree(_HOST_LOG_SESSION_DIRECTORY)
+
+
+atexit.register(_cleanup_host_log_session_directory)
+
+
 def _initialize_host_log(log_level: int | None = None, *, defer_writer: bool = False) -> None:
     """Seed host-log state, optionally leaving its writer stopped for local forks.
 
@@ -1324,6 +1451,62 @@ def _flush_host_log_or_warn(context: str, timeout_ms: int = 1000) -> bool:
     return False
 
 
+def _resolve_collect_across_runs(collect_across_runs: bool | None, dfx_session: bool | None) -> bool:
+    """One value from the canonical name and the name the option shipped under.
+
+    `None` is "not given" for both, which is what makes the two spellings
+    symmetric: either one alone decides, giving both different values is an
+    error rather than a silent winner, and giving neither leaves the option off.
+    """
+    if dfx_session is None:
+        return bool(collect_across_runs)
+    if collect_across_runs is not None and bool(collect_across_runs) != bool(dfx_session):
+        raise ValueError(
+            f"collect_across_runs={collect_across_runs!r} and dfx_session={dfx_session!r} disagree; pass one of them"
+        )
+    return bool(dfx_session)
+
+
+def _initialize_chip_runtime(
+    impl: _ChipWorker,
+    device_id: int,
+    bins: RuntimeBinaries,
+    *,
+    log_level: int | None = None,
+    prewarm_config: CallConfig | None = None,
+    enable_sdma: bool = False,
+    collect_across_runs: bool = False,
+    workspace_budget_bytes: int = 0,
+    manage_workspace: bool = False,
+    requested_pipeline_depth: int = 0,
+) -> None:
+    """Bind one native chip runtime from binary paths and initialize its host logger.
+
+    The caller owns lifecycle admission, callable slots and cleanup after failure.
+    """
+    _initialize_host_log(log_level)
+    dispatcher_path = getattr(bins, "dispatcher_path", None)
+    sim_context_path = getattr(bins, "sim_context_path", None)
+    sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
+    # C++ retains libcpu_sim_context.so in the sim process registry. Sim has
+    # no dispatcher; onboard bootstrap consumes its actual binary path.
+    impl.init(
+        str(bins.host_path),
+        str(bins.aicpu_path),
+        str(bins.aicore_path),
+        "" if dispatcher_path is None else str(dispatcher_path),
+        int(device_id),
+        prewarm_config,
+        bool(enable_sdma),
+        "" if sim_context_path is None else str(sim_context_path),
+        "" if sdma_warmup_path is None else str(sdma_warmup_path),
+        bool(collect_across_runs),
+        int(workspace_budget_bytes),
+        bool(manage_workspace),
+        int(requested_pipeline_depth),
+    )
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -1353,6 +1536,8 @@ class ChipWorker:
         self._identity_registry: dict[bytes, Any] = {}
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
+        self._run_lock = threading.Lock()
+        self._argument_imports: ImportRegistry | None = None
 
     def init(
         self,
@@ -1364,6 +1549,11 @@ class ChipWorker:
         log_level: int | None = None,
         prewarm_config: CallConfig | None = None,
         enable_sdma: bool = False,
+        collect_across_runs: bool | None = None,
+        dfx_session: bool | None = None,
+        workspace_budget_bytes: int = 0,
+        manage_workspace: bool = False,
+        requested_pipeline_depth: int = 0,
     ):
         """Attach the calling thread to ``device_id``, load the host runtime
         library, and cache platform binaries.
@@ -1389,6 +1579,83 @@ class ChipWorker:
             log_level: Threshold (10=DEBUG, 20=INFO, 25=TIMING, 30=WARN,
                 40=ERROR, 60=NUL). Defaults to a snapshot of the simpler
                 logger via `_log.get_current_config()`.
+            workspace_budget_bytes: Finite byte budget for this context's
+                workspace regions — the per-slot retained temporary buffer and
+                the three pooled arena regions. 0 (the default) enforces no
+                budget; it does not decide whether those regions have an owner,
+                which the onboard program init entry gives them for every
+                caller. A non-zero value on a module without workspace support
+                raises rather than running unmanaged.
+                Partial accounting: external tensors, run-result and
+                diagnostics regions, code and device ELF, RTS and provider
+                memory are outside it, so it is not a device-wide ceiling.
+            manage_workspace: Accepted and ignored. Those same four regions are
+                put under one owner by the onboard program init entry, for
+                every caller, so nothing has to request it: a superseded
+                generation is released once its last consumer retires rather
+                than when its replacement is published, a failed growth leaves
+                the previous plan installed, and a failed release is recorded
+                instead of discarded. Kept so existing callers keep working. A
+                simulated backend manages no device workspace and is
+                unchanged.
+            requested_pipeline_depth: How many native run-resource sets this
+                context may hold at once, or 0 for the standing default of
+                two — which is what every runtime granted before this
+                argument existed, so a caller who asks for nothing keeps that
+                capacity and that footprint however high the runtime's
+                published maximum goes. The granted count is the smaller of
+                what is asked and the runtime's supported maximum, and it is
+                latched here — before any per-slot storage is built or
+                prewarmed — because nothing can resize those pools
+                afterwards. `pipeline_depth` reports what was granted.
+            collect_across_runs: Let a run's records outlive its own boundary,
+                so the sealing and the file write happen while the next run
+                executes instead of at the boundary. Off when neither this nor
+                `dfx_session` is given, and off means today's behaviour in
+                every respect — including that a run's swimlane file exists
+                when its `run()` returns.
+
+                Every collection level is served, orchestrator phases (level 4)
+                included: each run's phases go to its own background file.
+                The level a collector serves is the one its device pools were
+                built for — the first collected run's, or the first run after a
+                shape change rebuilt them — so a device-orchestrated run that
+                would need an orchestrator pool an earlier, lower level did not
+                build is refused before anything is allocated, leaving every
+                earlier run's records intact. Profile at the level you want from
+                the first collected run.
+
+                `run()` returning does not mean that run's diagnostic files are
+                complete: the sealing and the write it moved off the boundary
+                may still be in flight. `flush_diagnostics()` returning is the
+                statement that every artifact its enabled collectors promised up
+                to that point is published, and it raises rather than returns
+                over one of those that is missing. So wait for every run, then
+                flush, then read what each collector promises — the swimlane,
+                the args dump, scope stats, `deps.json`, PMU's CSV.
+
+                What a collector promises is its own rule rather than a file per
+                run: a PMU run proved to have produced no records writes no
+                `pmu.csv` and is still a success, so an absent file is not by
+                itself a failure. `Worker.flush_diagnostics` carries each
+                collector's rule. `deps.json` on `host_build_graph` is a further
+                step removed from the run, because the graph is built during
+                `submit`: the file describes what was going to execute, and can
+                be published for a run that never launched or that later failed
+                on the device.
+
+                With args dump enabled this also moves that run's argument
+                *content*: its payload file and its manifest are finished in
+                the background, so the payload file may still be growing when a
+                reader opens it, and the manifest is what publication produces.
+                Each run owns an exclusive `args.e<epoch>.bin`, the manifest
+                names it through the `bin_file` field readers already use, and
+                nothing is deleted — a reused output prefix accumulates files. A
+                run that dies without an observed device fence is **not**
+                recovered on this path, which the default path does do; see
+                docs/dfx/args-dump.md.
+            dfx_session: The name this option shipped under, accepted as an
+                alias. Giving both spellings different values is an error.
 
         For tests that need to drive the binding directly with arbitrary path
         strings (e.g. to assert dlopen failure on `/nonexistent/foo.so`), call
@@ -1404,24 +1671,17 @@ class ChipWorker:
             self._init_in_progress = True
 
         try:
-            _initialize_host_log(log_level)
-
-            # C++ retains libcpu_sim_context.so in the sim process registry,
-            # loads host_runtime.so, and binds both private logger copies.
-            # dispatcher_path is empty on sim; onboard consumes the real path.
-            dispatcher_path = getattr(bins, "dispatcher_path", None)
-            sim_context_path = getattr(bins, "sim_context_path", None)
-            sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
-            self._impl.init(
-                str(bins.host_path),
-                str(bins.aicpu_path),
-                str(bins.aicore_path),
-                "" if dispatcher_path is None else str(dispatcher_path),
-                int(device_id),
-                prewarm_config,
-                bool(enable_sdma),
-                "" if sim_context_path is None else str(sim_context_path),
-                "" if sdma_warmup_path is None else str(sdma_warmup_path),
+            _initialize_chip_runtime(
+                self._impl,
+                device_id,
+                bins,
+                log_level=log_level,
+                prewarm_config=prewarm_config,
+                enable_sdma=enable_sdma,
+                collect_across_runs=_resolve_collect_across_runs(collect_across_runs, dfx_session),
+                workspace_budget_bytes=workspace_budget_bytes,
+                manage_workspace=manage_workspace,
+                requested_pipeline_depth=requested_pipeline_depth,
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)
@@ -1429,20 +1689,37 @@ class ChipWorker:
             with self._lifecycle_lock:
                 self._init_in_progress = False
 
+    def flush_diagnostics(self, timeout_ms: int = 30000) -> None:
+        """Publish every diagnostic run this chip has closed.
+
+        A no-op unless `init(collect_across_runs=True)` let runs be retained.
+        Raises RuntimeError when a run that was promised a file did not get
+        one; a published partial carries its verdict in the file and is not a
+        failure.
+        """
+        self._impl.flush_diagnostics(int(timeout_ms))
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
         Terminal operation — the object cannot be reused after this.
         """
-        with self._lifecycle_lock:
-            owner = self._init_owner_thread
-            if owner is not None and owner is not threading.current_thread():
-                raise RuntimeError("ChipWorker.finalize() must run on the thread that called ChipWorker.init()")
-            if self._init_in_progress:
-                raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
-        try:
-            self._impl.finalize()
-        finally:
+        with self._run_lock:
+            with self._lifecycle_lock:
+                owner = self._init_owner_thread
+                if owner is not None and owner is not threading.current_thread():
+                    raise RuntimeError("ChipWorker.finalize() must run on the thread that called ChipWorker.init()")
+                if self._init_in_progress:
+                    raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
+            try:
+                self._impl.finalize()
+            except BaseException:
+                # The registries name what the native side still holds. A teardown
+                # that did not complete leaves those resources alive, so dropping
+                # the registries would hide them from a retry and from the caller.
+                _flush_host_log_or_warn("ChipWorker.finalize()")
+                raise
+            self._close_argument_imports()
             _flush_host_log_or_warn("ChipWorker.finalize()")
             with self._registry_lock:
                 self._callable_registry.clear()
@@ -1523,6 +1800,8 @@ class ChipWorker:
             hashid_to_digest,
         )
 
+        if self.initialized:
+            self._impl._validate_execution_context()
         descriptor = build_chip_callable_descriptor(target=callable)
         hashid = compute_callable_hashid(descriptor)
         digest = hashid_to_digest(hashid)
@@ -1561,7 +1840,7 @@ class ChipWorker:
     def run(
         self,
         handle: CallableHandle,
-        args: ChipStorageTaskArgs,
+        args: TaskArgs | ChipStorageTaskArgs,
         config: CallConfig | None = None,
         **kwargs: Any,
     ):
@@ -1569,7 +1848,11 @@ class ChipWorker:
 
         Args:
             handle: ``CallableHandle`` returned by ``register_callable``.
-            args: ChipStorageTaskArgs for this invocation.
+            args: TaskArgs with scalar values, HOST/NONE controls (HBG), and
+                contiguous HOST/H2D tensors.
+                DEVICE descriptors require Worker(level=2).submit, which validates
+                their live source registration. ChipStorageTaskArgs is accepted
+                for compatibility with callers supplying resolved addresses.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g.
                 ``aicpu_thread_num=2``). A run always takes the whole device;
@@ -1578,12 +1861,59 @@ class ChipWorker:
 
         Returns ``None``. Per-stage run timing is emitted as ``[STRACE]`` log
         markers by the platform — see ``docs/dfx/host-trace.md``.
+
+        Keep tensor backing storage alive through return. TaskArgs imports are
+        released after native success; a native-call error retains them and
+        refuses further public runs until finalize() succeeds. This retains
+        mappings, not ownership of the caller's allocation.
         """
-        state = self._resolve_handle(handle)
-        self._run_slot(state.slot_id, args, config, **kwargs)
+        with self._run_lock:
+            state = self._resolve_handle(handle)
+            if self._argument_imports is not None:
+                raise RuntimeError("ChipWorker.run: retained argument mappings require successful finalize()")
+            config = self._run_config(config, kwargs)
+            if isinstance(args, TaskArgs):
+                args = _ti_module._snapshot_local_task_args(args)
+                _validate_host_control_access(state.target, args)
+                for i in range(args.tensor_count()):
+                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE:
+                        raise ValueError(
+                            f"ChipWorker.run: argument {i} is DEVICE; use Worker(level=2).submit "
+                            "for source registration and lifetime validation"
+                        )
+                    if args.transfer(i) == TensorTransfer.NONE:
+                        continue
+                    if args.transfer(i) != TensorTransfer.H2D:
+                        raise ValueError(f"ChipWorker.run: argument {i} requires NONE or H2D transfer")
+                    tensor = args.tensor(i)
+                    expected = 1
+                    shapes, strides = tensor.shapes, tensor.strides
+                    for dim in range(len(shapes) - 1, -1, -1):
+                        if strides[dim] != expected:
+                            raise ValueError(f"ChipWorker.run: argument {i} requires contiguous H2D storage")
+                        expected *= shapes[dim]
+                registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
+                self._argument_imports = registry
+                try:
+                    args = _ti_module.materialize_task_args(args, registry.materialize_args(args))
+                except BaseException:
+                    self._close_argument_imports()
+                    raise
+            # A native exception leaves completion unproven. Imports remain live
+            # until successful device teardown; no finally block may unmap them.
+            self._impl.run(int(state.slot_id), args, config)
+            self._close_argument_imports()
+
+    def _close_argument_imports(self) -> None:
+        registry = self._argument_imports
+        if registry is not None:
+            registry.close()
+            self._argument_imports = None
 
     def unregister_callable(self, handle) -> None:
         """Drop one live callable handle and release its private resources when final."""
+        if self.initialized:
+            self._impl._validate_execution_context()
         with self._registry_lock:
             state = self._resolve_handle_locked(handle)
             self._live_handles.pop(handle._handle_id, None)
@@ -1600,19 +1930,27 @@ class ChipWorker:
     def _register_callable_at_slot(self, callable_id, callable):
         self._impl.register_callable(int(callable_id), callable)
 
-    def _run_slot(self, callable_id, args, config=None, **kwargs):
+    @staticmethod
+    def _run_config(config, overrides):
         if config is None:
             config = CallConfig()
-        for k, v in kwargs.items():
+        for k, v in overrides.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
+        return config
+
+    def _run_slot(self, callable_id, args, config=None, **kwargs):
         # Returns None; per-stage timing is emitted as `[STRACE]` log markers.
-        self._impl.run(int(callable_id), args, config)
+        self._impl.run(int(callable_id), args, self._run_config(config, kwargs))
 
     def _run_slot_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
         if config is None:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         self._impl._run_with_pipeline_lease(int(callable_id), args, config, int(slot_id), int(generation))
 
     def _prepare_native_run_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
@@ -1628,6 +1966,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
+        if config.output_prefix:
+            _bind_host_log_session_directory()
         return self._impl._prepare_native_run_with_pipeline_lease(
             int(callable_id), args, config, int(slot_id), int(generation)
         )
@@ -1663,6 +2003,30 @@ class ChipWorker:
     def _finalize_native_run(self, run):
         self._impl._finalize_native_run(run)
 
+    def _probe_run_retention(
+        self,
+        run,
+        successor,
+        launch_successor=True,
+        boundary_timeout_ms=0,
+        successor_start_timeout_ms=0,
+        use_retained_sync=False,
+    ):
+        """Run #2267's late-read retention fixture; see run_retention_probe.h.
+
+        ``run`` must be launched and undrained, ``successor`` prepared on
+        another slot. Both are left finalizable and the caller still owes
+        ``_finalize_native_run`` for each. Onboard only.
+        """
+        return self._impl._probe_run_retention(
+            run,
+            successor,
+            bool(launch_successor),
+            int(boundary_timeout_ms),
+            int(successor_start_timeout_ms),
+            bool(use_retained_sync),
+        )
+
     def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))
 
@@ -1684,6 +2048,40 @@ class ChipWorker:
     @property
     def pipeline_depth(self):
         return self._impl.pipeline_depth
+
+    @property
+    def launch_depth(self):
+        """How many runs this worker may have launched at once, after its request was resolved."""
+        return self._impl.launch_depth
+
+    def configure_launch_depth(self, depth):
+        """Ask, before init, for a launch depth.
+
+        Depth 1 is the serial path: nothing is ordered behind anything, and no run constructs the
+        boundary that would let it be.
+
+        Rejected rather than coerced: ``int(1.9)`` is 1 and ``int(True)`` is 1, so coercion would
+        silently pick a device-work capacity the caller did not ask for. ``bool`` is an ``int``
+        subclass, hence the exact type test.
+        """
+        if type(depth) is not int:
+            raise TypeError(f"launch_depth must be an int, got {type(depth).__name__}")
+        if depth < 1:
+            raise ValueError(f"launch_depth must be >= 1, got {depth}")
+        self._impl.configure_launch_depth(depth)
+
+    @property
+    def supports_joined_native_launch(self):
+        """Whether one run's native submission may be ordered behind another's right now."""
+        return bool(self._impl.supports_joined_native_launch)
+
+    def set_exported_device_regions_live(self, live):
+        """Declare whether this worker's host side still owns exported device regions.
+
+        While it does, no run is ordered behind another: those regions are released before the
+        child's device reset.
+        """
+        self._impl.set_exported_device_regions_live(bool(live))
 
     @property
     def runtime_slot_count(self):

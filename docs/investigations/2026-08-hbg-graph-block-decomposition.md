@@ -4,8 +4,8 @@
 **Verdict**: adopted at seven Definitions, once #1929 removed the single recording slot the first measurement failed against — the win is smaller than the orchestration window alone suggests, because seven Definitions are seven images to upload
 
 > **Names in this entry are the ones in use at the time.** A task inside a Graph
-> body was a "node" and the record phase was `record_node`; they are now an
-> in-graph task and `record_in_graph_task`. `strace_timing.py` still accepts the
+> body was a "node" and the record phase was `record_node`; they are now a
+> sub-task and `record_sub_task`. `strace_timing.py` still accepts the
 > old phase name, so logs from this investigation remain readable.
 
 ## Question
@@ -90,12 +90,18 @@ Three things a name comparison cannot see, all of which the checks above caught:
 ### Why it regressed between #1897 and #1929
 
 Over that range `graph_begin` held **one recording slot for the whole
-orchestration**. A Graph whose `full_key` differed from the in-flight recording's
-got the default `GraphScopeResult` back — `execute_block=true, recording=false` —
+orchestration**. A Graph whose cache key (then named `full_key`) differed from
+the in-flight recording's got the default `GraphScopeResult` back —
+`execute_block=true, recording=false` —
 and `rt_submit_graph_impl` ran its body on the ordinary path, with no warning and
 no retry, even though the `rt_graph_commit()` on that same branch then waited for
 the recorder to go idle. So k distinct Definitions submitted back to back got
 roughly every other one recorded.
+
+> Historical. The `execute_block` field and the ordinary-path fallback it selected
+> are both gone: a Graph that cannot be opened now latches a fatal naming the
+> reason, and `GraphScopeResult` carries `has_error` instead. The silent
+> degradation described here is the behaviour that change removed.
 
 That is exactly what block decomposition produces: where the pair form submits
 one key per iteration and never contends, the four-block form submits four

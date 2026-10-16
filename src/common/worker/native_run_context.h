@@ -19,15 +19,10 @@
 #include "call_config.h"
 #include "common/host_api.h"
 #include "native_run_execution.h"
+#include "native_run_phase.h"
+#include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
-
-/** Internal phase of the caller-owned opaque native-run storage. */
-enum class NativeRunPhase : uint8_t {
-    Prepared,
-    Running,
-    Complete,
-};
 
 /**
  * The single placement-owned carrier for one progressable native lifecycle.
@@ -37,7 +32,7 @@ enum class NativeRunPhase : uint8_t {
  */
 template <typename Runner>
 struct NativeRunContext {
-    static constexpr uint64_t kMagic = UINT64_C(0x534d504c52554e31);  // "SMPLRUN1"
+    static constexpr uint64_t kMagic = kNativeRunContextMagic;
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,
@@ -46,7 +41,9 @@ struct NativeRunContext {
         runner(runner_in),
         config(config_in),
         descriptor(descriptor_in),
-        host_api(runner_in, descriptor_in.pipeline_slot, descriptor_in.arena_bank, host_api_ops),
+        host_api(
+            runner_in, descriptor_in.pipeline_slot, descriptor_in.arena_bank, descriptor_in.run_epoch, host_api_ops
+        ),
         trace_hid(trace_hid_in) {
         // Publish the storage tag only after every potentially-throwing member
         // has been constructed. A failed placement construction must leave the
@@ -78,6 +75,7 @@ struct NativeRunContext {
     uint64_t trace_inv{0};
     long long trace_start_ns{0};
     long long runner_trace_start_ns{0};
+    uint64_t clock_log_offset{0};
     int completion_rc{-1};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};
     std::unique_ptr<typename Runner::PreparedExecution> prepared_execution{};
@@ -93,6 +91,32 @@ struct NativeRunContext {
         return NativeRunIdentity{
             descriptor.run_epoch, descriptor.generation, descriptor.dispatch_id, descriptor.pipeline_slot
         };
+    }
+
+    /**
+     * This run's whole published identity, by value.
+     *
+     * Separate from `identity()` because that one carries what later phase
+     * calls address the run by, and has no field for `run_id` — which a reader
+     * joining an artifact to the submission that produced it needs. The
+     * acceptance sink and its value are deliberately absent: they are the
+     * caller's pointer and sentinel, and belong to `publish_acceptance` alone.
+     */
+    NativeRunArtifactIdentity artifact_identity() const {
+        NativeRunArtifactIdentity snapshot{};
+        snapshot.run_id = descriptor.run_id;
+        snapshot.dispatch_id = descriptor.dispatch_id;
+        snapshot.generation = descriptor.generation;
+        std::memcpy(
+            snapshot.owner_instance_id, descriptor.provenance.owner_instance_id, sizeof(snapshot.owner_instance_id)
+        );
+        snapshot.pipeline_slot = descriptor.pipeline_slot;
+        snapshot.chip_rank = descriptor.provenance.chip_rank;
+        snapshot.capture_index = descriptor.provenance.capture_index;
+        snapshot.task_slot = descriptor.provenance.task_slot;
+        snapshot.group_index = descriptor.provenance.group_index;
+        snapshot.group_size = descriptor.provenance.group_size;
+        return snapshot;
     }
 };
 

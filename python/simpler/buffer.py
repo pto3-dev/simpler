@@ -24,12 +24,14 @@ side table lives only in the owning process.
 from __future__ import annotations
 
 import ctypes
+import operator
 import os
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, Protocol
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     OWNER_INSTANCE_ID_BYTES,
@@ -40,6 +42,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CanonicalIdentity,
     DataType,
     Tensor,
+    TensorTransfer,
     read_args_from_blob,
 )
 
@@ -59,8 +62,10 @@ from .comm_endpoints import (
 __all__ = [
     "AccessMode",
     "AddressSpace",
+    "TensorTransfer",
     "BackendKind",
     "Buffer",
+    "BufferLocation",
     "BufferCapability",
     "BufferDescriptor",
     "CanonicalIdentity",
@@ -115,14 +120,6 @@ BufferDescriptor.owner_worker_path = property(
 )
 
 
-def _row_major_strides(shapes: tuple[int, ...]) -> tuple[int, ...]:
-    """Contiguous (row-major) element strides for ``shapes``: strides[i] = prod(shapes[i+1:])."""
-    strides = [1] * len(shapes)
-    for i in range(len(shapes) - 2, -1, -1):
-        strides[i] = strides[i + 1] * shapes[i + 1]
-    return tuple(strides)
-
-
 def mint_owner_instance_id() -> bytes:
     """A fresh opaque nonce, unique per owner incarnation (defends identity against ABA).
 
@@ -131,6 +128,50 @@ def mint_owner_instance_id() -> bytes:
     one process within one second — a routine pattern (an L4 and its L3 built back to back).
     """
     return os.urandom(OWNER_INSTANCE_ID_BYTES)
+
+
+_UINT64_MAX = (1 << 64) - 1
+
+
+class BufferIdentityExhaustedError(RuntimeError):
+    """The owner's uint64 buffer-id space cannot mint another identity."""
+
+
+def _require_allocator_owner_nonce(nonce: object) -> bytes:
+    if not isinstance(nonce, (bytes, bytearray)):
+        raise TypeError("owner_instance_id must be bytes")
+    value = bytes(nonce)
+    if len(value) != 8 or value == b"\x00" * 8:
+        raise ValueError("owner_instance_id must be a nonzero 8-byte nonce")
+    return value
+
+
+class EndpointBufferIdentityAllocator(Protocol):
+    @property
+    def owner_instance_id(self) -> bytes: ...
+
+    def burn_identity(self) -> CanonicalIdentity: ...
+
+
+class LocalEndpointBufferIdentityAllocator:
+    """Thread-safe owner-scoped canonical Buffer identity allocator."""
+
+    def __init__(self, owner_instance_id: bytes) -> None:
+        self._owner_instance_id = _require_allocator_owner_nonce(owner_instance_id)
+        self._lock = threading.Lock()
+        self._next_buffer_id = 1
+
+    @property
+    def owner_instance_id(self) -> bytes:
+        return self._owner_instance_id
+
+    def burn_identity(self) -> CanonicalIdentity:
+        with self._lock:
+            buffer_id = self._next_buffer_id
+            if buffer_id > _UINT64_MAX:
+                raise BufferIdentityExhaustedError("buffer identity space exhausted")
+            self._next_buffer_id = buffer_id + 1
+        return CanonicalIdentity(self._owner_instance_id, buffer_id, 1)
 
 
 def _shm_base_addr(shm: SharedMemory) -> int:
@@ -143,9 +184,137 @@ def _shm_base_addr(shm: SharedMemory) -> int:
     return addr
 
 
+@dataclass(frozen=True)
+class BufferLocation:
+    """A live, process-local device context issued by ``Worker.device_location``.
+
+    The context incarnation is opaque. A device ordinal alone is not a location;
+    a location from another Worker or a forked process cannot authorize an address.
+    """
+
+    _source: _DeviceBufferSource = field(repr=False)
+
+    @property
+    def address_space(self) -> AddressSpace:
+        return AddressSpace.DEVICE
+
+    @property
+    def device_id(self) -> int:
+        return self._source.device_id
+
+
+@dataclass
+class _SourceBufferRecord:
+    snapshot: Buffer
+    uses: int = 0
+
+
+class _DeviceBufferSource:
+    """Source registrations and accepted uses, independent of consumer import caches."""
+
+    def __init__(self, allocator: EndpointBufferIdentityAllocator, device_id: int, alive: Callable[[], bool]):
+        self.device_id = device_id
+        self._allocator = allocator
+        self._alive = alive
+        self._pid = os.getpid()
+        self._lock = threading.Lock()
+        self._records: dict[CanonicalIdentity, _SourceBufferRecord] = {}
+
+    def _check_process(self) -> None:
+        # A mutex inherited while locked cannot be acquired in the forked child.
+        if os.getpid() != self._pid:
+            raise ValueError("Buffer source does not belong to this process")
+
+    def _check_context(self) -> None:
+        self._check_process()
+        if not self._alive():
+            raise ValueError("Buffer location is not a live device context in this process")
+
+    def wrap(self, address: int, nbytes: int, access: AccessMode) -> Buffer:
+        self._check_process()
+        if any(isinstance(value, bool) for value in (address, nbytes)):
+            raise TypeError("Buffer.wrap requires integer address and nbytes")
+        address, nbytes = operator.index(address), operator.index(nbytes)
+        if address <= 0 or nbytes <= 0 or address + nbytes > 1 << 64:
+            raise ValueError("Buffer.wrap requires a nonempty uint64 address range")
+        if access not in (AccessMode.READ, AccessMode.WRITE, AccessMode.READWRITE):
+            raise ValueError("Buffer.wrap requires a valid access grant")
+        with self._lock:
+            self._check_context()
+            for record in self._records.values():
+                other = record.snapshot
+                if address < other.base + other.nbytes and other.base < address + nbytes:
+                    raise ValueError("Buffer.wrap range overlaps a live Buffer; derive another Tensor view")
+            identity = self._allocator.burn_identity()
+            handle = wrap_device_malloc(
+                address,
+                nbytes,
+                bytes(identity.owner_instance_id),
+                int(identity.buffer_id),
+                generation=int(identity.generation),
+                access=access,
+            )
+            snapshot = replace(handle)
+            snapshot.freeze_descriptor()
+            self._records[identity] = _SourceBufferRecord(snapshot)
+            handle._source_registration = (self, identity)
+            return handle
+
+    def validate(self, identity: CanonicalIdentity, descriptor: BufferDescriptor) -> None:
+        self._check_process()
+        with self._lock:
+            self._check_context()
+            record = self._records.get(identity)
+            if record is None:
+                raise ValueError("Buffer source registration is released")
+            if descriptor != record.snapshot.to_descriptor():
+                raise ValueError("Buffer descriptor does not match its source registration")
+
+    def acquire(self, args: Any, attached: set[CanonicalIdentity]) -> list[Buffer]:
+        """Validate every named source before reserving any; no backing bytes are read."""
+        self._check_process()
+        with self._lock:
+            self._check_context()
+            found = {}
+            for index in range(args.tensor_count()):
+                desc = args.tensor(index).buffer
+                record = self._records.get(desc.identity)
+                if record is None:
+                    if desc.identity in attached:
+                        raise ValueError("Buffer source registration is released")
+                    continue
+                if desc != record.snapshot.to_descriptor():
+                    raise ValueError("Buffer descriptor does not match its source registration")
+                found[desc.identity] = record
+            for record in found.values():
+                record.uses += 1
+            return [record.snapshot for record in found.values()]
+
+    def release(self, identities: Iterable[CanonicalIdentity]) -> None:
+        self._check_process()
+        with self._lock:
+            for identity in identities:
+                self._records[identity].uses -= 1
+
+    def live(self, identity: CanonicalIdentity) -> bool:
+        self._check_process()
+        with self._lock:
+            return identity in self._records
+
+    def close(self, identity: CanonicalIdentity) -> None:
+        self._check_process()
+        with self._lock:
+            record = self._records.get(identity)
+            if record is None:
+                return
+            if record.uses:
+                raise RuntimeError("Buffer has in-flight or unproven device uses; close is not a device fence")
+            del self._records[identity]
+
+
 @dataclass
 class Buffer:
-    """Owner-side registry object for one shared backing; owns the POSIX shm that backs it."""
+    """A backing handle: owns shared host memory or names registered device storage."""
 
     identity: CanonicalIdentity
     address_space: AddressSpace
@@ -165,12 +334,46 @@ class Buffer:
     # which is the derivation gate — a close() whose unlink raised leaves this false so a retry
     # attempts the unlink again.
     unlinked: bool = False
+    # Set only on a Buffer whose descriptor fields are final for the rest of its life — the private
+    # snapshot `Worker._record_device_alloc` registers. `init=False` keeps `replace()` from carrying
+    # it onto a copy, so a handle a caller still holds derives a fresh descriptor on every call and
+    # a field it changes stays visible to the provenance comparison that rejects it.
+    _descriptor: BufferDescriptor | None = field(default=None, init=False, compare=False, repr=False)
+
+    _source_registration: tuple[_DeviceBufferSource, CanonicalIdentity] | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+    @classmethod
+    def wrap(
+        cls, *, address: int, nbytes: int, location: BufferLocation, access: AccessMode = AccessMode.READWRITE
+    ) -> Buffer:
+        """Register caller-owned device storage without attaching it to a consumer.
+
+        The caller guarantees the real device, capacity, stable address and allocation
+        lifetime through every use and recovery. No allocation owner is retained.
+        Only local device contexts are supported; HOST and remote wrapping are refused.
+        ``close()`` revokes this registration without freeing the address.
+        """
+        if not isinstance(location, BufferLocation) or not isinstance(location._source, _DeviceBufferSource):
+            raise TypeError("Buffer.wrap requires a live BufferLocation from a device context")
+        return location._source.wrap(address, nbytes, access)
+
+    def freeze_descriptor(self) -> None:
+        """Derive the descriptor once and answer every later `to_descriptor()` from it.
+
+        Valid only on a Buffer no other reference can reach: a field changed afterwards would not
+        reach the descriptor.
+        """
+        self._descriptor = self.to_descriptor()
 
     def to_descriptor(self) -> BufferDescriptor:
         """The wire descriptor for this backing — what a consumer needs to resolve it."""
         if self.closed:
             raise ValueError(f"Buffer: cannot derive a descriptor from a released buffer ({self.identity})")
-        return BufferDescriptor(
+        if self._descriptor is not None:
+            return self._descriptor
+        descriptor = BufferDescriptor(
             identity=self.identity,
             address_space=self.address_space,
             owner_worker_path_id=self.owner_worker_path_id,
@@ -179,30 +382,28 @@ class Buffer:
             nbytes=self.nbytes,
             body=self.body,
         )
+        if self._source_registration is not None:
+            source, identity = self._source_registration
+            source.validate(identity, descriptor)
+        return descriptor
 
     def tensor(
         self,
-        shapes: tuple[int, ...],
+        shapes: Iterable[int],
         dtype: int | DataType,
-        strides: tuple[int, ...] | None = None,
+        strides: Iterable[int] | None = None,
         byte_offset: int = 0,
     ) -> Tensor:
-        """A self-describing ``Tensor`` viewing this buffer: embeds the full descriptor + the view.
+        """Compatibility forwarding to ``Tensor(self, shapes=shapes, dtype=dtype, ...)``.
 
+        ``shapes`` and ``strides`` are each consumed once, so any iterable of ints will do.
         ``strides`` default to contiguous (row-major) — ``buffer.tensor(shape, dtype)`` names the
         whole buffer as a contiguous view; pass explicit element strides for a strided view.
-        ``byte_offset`` must be a multiple of the dtype size (checked at materialization).
+        ``byte_offset`` must be a multiple of the dtype size (checked at construction).
         ``dtype`` accepts a ``DataType`` enum or its int value.
+        Transfer requests belong to ``TaskArgs.add_tensor(..., transfer=...)``.
         """
-        shapes = tuple(shapes)
-        strides = _row_major_strides(shapes) if strides is None else tuple(strides)
-        return Tensor(
-            buffer=self.to_descriptor(),
-            byte_offset=byte_offset,
-            shapes=shapes,
-            strides=strides,
-            dtype=dtype,
-        )
+        return Tensor(self, shapes=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
 
     def close(self) -> None:
         """Release the backing. The owner unlinks it, so a later consumer map fails rather than
@@ -217,6 +418,9 @@ class Buffer:
         place, so a second ``close()`` attempts it again — that retry is what
         ``Worker._release_all_buffers`` leaves the registry entry behind for.
         """
+        if self._source_registration is not None:
+            source, identity = self._source_registration
+            source.close(identity)
         self.closed = True
         shm = self.shm
         if shm is None:
@@ -333,14 +537,7 @@ def remote_sidecar_tensor(
         nbytes=nbytes,
         body=b"",
     )
-    shapes = tuple(shapes)
-    return Tensor(
-        buffer=descriptor,
-        byte_offset=byte_offset,
-        shapes=shapes,
-        strides=_row_major_strides(shapes),
-        dtype=int(dtype),
-    )
+    return descriptor.tensor(shapes, int(dtype), None, byte_offset)
 
 
 def wrap_fork_inherited(
@@ -457,6 +654,44 @@ def wrap_vmm_window(
         backend_kind=BackendKind.VMM_WINDOW,
         nbytes=nbytes,
         body=int(device_ptr).to_bytes(8, "little"),
+        shm=None,
+        base=int(device_ptr),
+        owner_worker_id=int(owner_worker_id),
+    )
+
+
+def _wrap_vmm_shareable(
+    device_ptr: int,
+    nbytes: int,
+    device_id: int,
+    mapping_bytes: int,
+    shareable_handle: int,
+    identity: CanonicalIdentity,
+    owner_worker_path: str = "",
+    owner_worker_id: int = 0,
+) -> Buffer:
+    """Wrap an already-exported shareable VMM mapping as a Region-private ``VMM_SHAREABLE`` ``Buffer``.
+
+    ``identity`` is the caller-supplied canonical identity; this helper does not mint a nonce or
+    buffer id. The body is the 24-byte overlay ``device_id``, reserved 0, ``shareable_handle``,
+    ``mapping_bytes``. ``nbytes`` is the logical footprint and is not replaced by the mapping span.
+    ``shm`` stays ``None``: physical VMM release stays with the caller. ``device_ptr`` is the
+    provider-local base and may be 0.
+    """
+    body = (
+        int(device_id).to_bytes(4, "little", signed=True)
+        + (0).to_bytes(4, "little")
+        + int(shareable_handle).to_bytes(8, "little")
+        + int(mapping_bytes).to_bytes(8, "little")
+    )
+    return Buffer(
+        identity=identity,
+        owner_worker_path_id=intern_worker_path(owner_worker_path),
+        address_space=AddressSpace.DEVICE,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.VMM_SHAREABLE,
+        nbytes=int(nbytes),
+        body=body,
         shm=None,
         base=int(device_ptr),
         owner_worker_id=int(owner_worker_id),

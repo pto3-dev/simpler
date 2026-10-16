@@ -209,11 +209,11 @@ class TestRunStreamReuseHbg(SceneTestCase):
         self.compute_golden(golden_args, params, subtract=subtract)
         chip_args, output_names = _build_chip_task_args(test_args, self.CALLABLE["orchestration"]["signature"])
         state = worker._resolve_handle(handle)
-        worker._chip_worker._run_slot_with_pipeline_lease(
+        worker._chip_worker._run_with_pipeline_lease(
             state.slot_id,
             chip_args,
-            slot_id,
-            generation,
+            slot_id=slot_id,
+            generation=generation,
             config=self._build_config(self.CASES[0].get("config", {})),
         )
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
@@ -335,7 +335,7 @@ class TestRunStreamReuseHbg(SceneTestCase):
             st_worker.unregister(add_handle)
 
     def test_depth_two_slots_own_separate_resources(self, st_platform, st_worker):
-        """Each slot owns its own host Runtime buffer and its own arena bank.
+        """Each slot owns its own host Runtime buffer, arena bank, and staging buffer.
 
         Runs on simulation too: sim implements the same depth, so HBG — whose
         GM heap is HOST_PER_RUN — must commit a distinct bank per slot there as
@@ -388,17 +388,22 @@ class TestRunStreamReuseHbg(SceneTestCase):
             assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
             assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
 
-            # hbg stages device args directly, never through the retained
-            # temporary buffer, so neither slot should hold one.
-            assert chip_worker.retained_temp_addr(0) == 0
-            assert chip_worker.retained_temp_addr(1) == 0
+            # hbg stages device args through the retained temporary buffer, and
+            # that buffer is per pipeline slot. Both slots ran, so both hold
+            # one, and they must be distinct — sequential runs re-stage their
+            # arguments every round, so correct output alone would survive both
+            # slots sharing a staging buffer.
+            temp0 = chip_worker.retained_temp_addr(0)
+            temp1 = chip_worker.retained_temp_addr(1)
+            assert temp0 != 0 and temp1 != 0, f"a slot that ran staged nothing: slot0={temp0:#x}, slot1={temp1:#x}"
+            assert temp0 != temp1, f"both slots stage through one retained buffer: {temp0:#x}"
         finally:
             st_worker.unregister(add_handle)
 
     def test_unleased_runs_do_not_consume_lease_generations(self, st_platform, st_worker):
         """A slot pool's first lease is admitted however many runs precede it.
 
-        `PipelineSlotPool` is the only mint, and it starts every slot at
+        `RunResourceArena` is the only mint, and it starts every set at
         generation 1. A consumer that minted generations for its own unleased
         runs would have advanced past that, and the first real lease it was
         ever handed would be rejected as stale. This needs a worker whose

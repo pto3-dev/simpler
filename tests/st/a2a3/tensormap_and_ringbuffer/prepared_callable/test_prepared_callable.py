@@ -34,8 +34,45 @@ _SLOT_PRIMARY = 0
 _SLOT_SECONDARY = 1
 
 
+class _PreparedCallableMixin:
+    """Helpers shared by the prepared-callable classes in this module.
+
+    Plain mixin, so pytest collects nothing from it. It exists because the
+    intentional-failure case lives in its own class (see
+    ``TestPreparedCallableRegistrationFailure``) and needs the same argument
+    construction and single-run helper as the ordinary cases.
+    """
+
+    def generate_args(self, params):
+        size = 128 * 128
+        a, b = params["a"], params["b"]
+        return TaskArgsBuilder(
+            TensorArg("a", torch.full((size,), a, dtype=torch.float32)),
+            TensorArg("b", torch.full((size,), b, dtype=torch.float32)),
+            TensorArg("f", torch.zeros(size, dtype=torch.float32)),
+        )
+
+    def compute_golden(self, args, params):
+        args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
+
+    def _chip_worker(self, worker):
+        chip_worker = worker._chip_worker
+        assert chip_worker is not None
+        return chip_worker
+
+    def _run_one(self, worker, slot, config, case):
+        params = case["params"]
+        orch_sig = self.CALLABLE["orchestration"]["signature"]
+        test_args = self.generate_args(params)
+        chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
+        golden_args = test_args.clone()
+        self.compute_golden(golden_args, params)
+        self._chip_worker(worker).run(slot, chip_args, config=config)
+        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestPreparedCallable(SceneTestCase):
+class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
     """Exercise private prepare / run / unregister slot ABI.
 
     Requires an isolated L2 ``Worker`` (private slot table starts empty); this is
@@ -81,23 +118,6 @@ class TestPreparedCallable(SceneTestCase):
         },
     ]
 
-    def generate_args(self, params):
-        size = 128 * 128
-        a, b = params["a"], params["b"]
-        return TaskArgsBuilder(
-            TensorArg("a", torch.full((size,), a, dtype=torch.float32)),
-            TensorArg("b", torch.full((size,), b, dtype=torch.float32)),
-            TensorArg("f", torch.zeros(size, dtype=torch.float32)),
-        )
-
-    def compute_golden(self, args, params):
-        args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
-
-    def _chip_worker(self, worker):
-        chip_worker = worker._chip_worker
-        assert chip_worker is not None
-        return chip_worker
-
     def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
@@ -120,8 +140,8 @@ class TestPreparedCallable(SceneTestCase):
         chip_worker = self._chip_worker(worker)
 
         # 1) prepare two private slots with the SAME callable.
-        chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-        chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+        chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
+        chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
 
         # 2) run primary slot twice (second run proves dedup/cache hit)
         for _ in range(2):
@@ -130,7 +150,7 @@ class TestPreparedCallable(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            chip_worker._run_slot(_SLOT_PRIMARY, chip_args, config=config)
+            chip_worker.run(_SLOT_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         # 3) run secondary slot — different slot, same SO, must also work.
@@ -139,12 +159,12 @@ class TestPreparedCallable(SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        chip_worker._run_slot(_SLOT_SECONDARY, chip_args, config=config)
+        chip_worker.run(_SLOT_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         # 4) unregister both — should not raise.
-        chip_worker._unregister_slot(_SLOT_PRIMARY)
-        chip_worker._unregister_slot(_SLOT_SECONDARY)
+        chip_worker.unregister_callable(_SLOT_PRIMARY)
+        chip_worker.unregister_callable(_SLOT_SECONDARY)
 
     # ------------------------------------------------------------------
     # aicpu_dlopen_count assertions.
@@ -164,16 +184,6 @@ class TestPreparedCallable(SceneTestCase):
         config = self._build_config(case.get("config", {}))
         return callable_obj, config, case
 
-    def _run_one(self, worker, slot, config, case):
-        params = case["params"]
-        orch_sig = self.CALLABLE["orchestration"]["signature"]
-        test_args = self.generate_args(params)
-        chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
-        golden_args = test_args.clone()
-        self.compute_golden(golden_args, params)
-        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
-        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
-
     def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
         """Case A: prepare(primary) prewarms once; run x5 adds no dlopens."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
@@ -181,7 +191,7 @@ class TestPreparedCallable(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
             for _ in range(5):
@@ -193,7 +203,7 @@ class TestPreparedCallable(SceneTestCase):
             )
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_two_slots_alternating(self, st_platform, st_worker):
         """Case B: two prepares prewarm two slots; alternating runs add none."""
@@ -203,10 +213,10 @@ class TestPreparedCallable(SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
-            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 2
             for _ in range(5):
@@ -219,9 +229,9 @@ class TestPreparedCallable(SceneTestCase):
             )
         finally:
             if secondary_prepared:
-                chip_worker._unregister_slot(_SLOT_SECONDARY)
+                chip_worker.unregister_callable(_SLOT_SECONDARY)
             if primary_prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
         """Case C: prepare(primary) + prepare(primary) -> second call raises RuntimeError."""
@@ -229,13 +239,13 @@ class TestPreparedCallable(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             with pytest.raises(RuntimeError):
-                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dedup_shared_so_independent_unregister(self, st_platform, st_worker):
         """Case E: two slots on the same ChipCallable share one device orch SO buffer.
@@ -251,23 +261,94 @@ class TestPreparedCallable(SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
-            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             # Sanity: both slots work before any unregister.
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             self._run_one(st_worker, _SLOT_SECONDARY, config, case)
             # Drop primary; secondary's run must still succeed because the
             # dedup refcount is still > 0.
-            chip_worker._unregister_slot(_SLOT_PRIMARY)
+            chip_worker.unregister_callable(_SLOT_PRIMARY)
             primary_prepared = False
             self._run_one(st_worker, _SLOT_SECONDARY, config, case)
         finally:
             if secondary_prepared:
-                chip_worker._unregister_slot(_SLOT_SECONDARY)
+                chip_worker.unregister_callable(_SLOT_SECONDARY)
             if primary_prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
+
+    def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
+        """Case D: prepare+unregister+prepare prewarms twice -> delta == 2.
+
+        unregister erases the slot from aicpu_seen_callable_ids_, so the second
+        prepare prewarms the reused slot with a fresh AICPU dlopen. The counter
+        is monotonic (does NOT decrement on unregister), so the delta after the
+        second cycle is 2.
+        """
+        callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
+        baseline = st_worker.aicpu_dlopen_count
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
+        try:
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 1
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+            assert st_worker.aicpu_dlopen_count - baseline == 1
+            chip_worker.unregister_callable(_SLOT_PRIMARY)
+            prepared = False
+            after_unreg = st_worker.aicpu_dlopen_count
+            assert after_unreg - baseline == 1, (
+                f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
+            )
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 2
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+            assert st_worker.aicpu_dlopen_count - baseline == 2, (
+                f"after re-prepare expected counter +2 (two distinct AICPU dlopens), "
+                f"got delta {st_worker.aicpu_dlopen_count - baseline}"
+            )
+        finally:
+            if prepared:
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestPreparedCallableRegistrationFailure(_PreparedCallableMixin, SceneTestCase):
+    """Registration failures, on a worker no other case shares.
+
+    This case drives a failure through the device on purpose. The runner state
+    that produces belongs to the case that asked for it, not to whichever case
+    runs next, and ``st_worker`` is class-scoped (see ./conftest.py) — so the
+    boundary is a class of its own.
+
+    ``CASES`` carries this class's platform metadata and nothing else. The root
+    conftest deselects **every** item of a ``SceneTestCase`` class whose cases
+    match no platform, so an empty list here would drop the test below from CI
+    rather than merely quieting the inherited runner. The inherited runner is
+    quieted directly instead, by the shadow under ``test_run``.
+
+    Isolation confines shared mutable runner state. It is not a claim that the
+    device is restored: a notification the driver delivers later can still name
+    it, and only a confirmed reset retires a device generation.
+    """
+
+    CALLABLE = TestPreparedCallable.CALLABLE
+    CASES = TestPreparedCallable.CASES
+
+    # The generic scene-test runner reaches this class by inheritance, and this
+    # class's business is the failure below, not a scene case. `__test__ = False`
+    # keeps pytest from collecting it at all — a non-callable shadow would draw a
+    # PytestCollectionWarning, and a skip would report a case that was never
+    # meant to run here. `CASES` above stays real so platform selection still
+    # sees this class.
+    def test_run(self, *args, **kwargs):
+        raise AssertionError("TestPreparedCallableRegistrationFailure runs no scene case")
+
+    test_run.__test__ = False
 
     def test_prewarm_failure_rolls_back_registration(self, st_platform, st_worker):
         """Case F: missing AICPU orch entry fails prepare and leaves no prepared slot."""
@@ -283,50 +364,14 @@ class TestPreparedCallable(SceneTestCase):
         chip_worker = self._chip_worker(st_worker)
 
         with pytest.raises(RuntimeError):
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, bad_callable)
+            chip_worker.register_callable(_SLOT_PRIMARY, bad_callable)
         assert st_worker.aicpu_dlopen_count == baseline
 
         with pytest.raises(RuntimeError):
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
         assert st_worker.aicpu_dlopen_count == baseline
 
-        chip_worker._unregister_slot(_SLOT_PRIMARY)
-
-    def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
-        """Case D: prepare+unregister+prepare prewarms twice -> delta == 2.
-
-        unregister erases the slot from aicpu_seen_callable_ids_, so the second
-        prepare prewarms the reused slot with a fresh AICPU dlopen. The counter
-        is monotonic (does NOT decrement on unregister), so the delta after the
-        second cycle is 2.
-        """
-        callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
-        baseline = st_worker.aicpu_dlopen_count
-        prepared = False
-        chip_worker = self._chip_worker(st_worker)
-        try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-            prepared = True
-            assert st_worker.aicpu_dlopen_count - baseline == 1
-            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
-            assert st_worker.aicpu_dlopen_count - baseline == 1
-            chip_worker._unregister_slot(_SLOT_PRIMARY)
-            prepared = False
-            after_unreg = st_worker.aicpu_dlopen_count
-            assert after_unreg - baseline == 1, (
-                f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
-            )
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-            prepared = True
-            assert st_worker.aicpu_dlopen_count - baseline == 2
-            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
-            assert st_worker.aicpu_dlopen_count - baseline == 2, (
-                f"after re-prepare expected counter +2 (two distinct AICPU dlopens), "
-                f"got delta {st_worker.aicpu_dlopen_count - baseline}"
-            )
-        finally:
-            if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+        chip_worker.unregister_callable(_SLOT_PRIMARY)
 
 
 if __name__ == "__main__":

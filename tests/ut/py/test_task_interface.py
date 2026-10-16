@@ -10,9 +10,11 @@
 """Tests for the _task_interface nanobind extension and task_interface wrapper."""
 
 import ctypes
+import enum
 import gc
 import itertools
 import struct
+import sys
 import weakref
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
@@ -47,6 +49,9 @@ from simpler.buffer import (
     wrap_fork_inherited,
 )
 from simpler.task_interface import (
+    PROV_DESCRIPTOR_MISMATCH,
+    PROV_NOT_LIVE,
+    ProvenanceTable,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
@@ -69,6 +74,22 @@ def _dev_ref(addr, shapes, dtype, tag=None):
     return wrap_device_malloc(addr, nbytes, mint_owner_instance_id(), next(_REF_BID), "L2").tensor(
         tuple(shapes), int(dtype.value)
     )
+
+
+def _fork_ref(addr, shapes, dtype):
+    """A host-backed (FORK_SHM) ``Tensor``: names memory the owner allocation table does not hold."""
+    nbytes = get_element_size(dtype)
+    for s in shapes:
+        nbytes *= int(s)
+    return wrap_fork_inherited(
+        addr,
+        nbytes,
+        mint_owner_instance_id(),
+        next(_REF_BID),
+        "L2",
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.FORK_SHM,
+    ).tensor(tuple(shapes), int(dtype.value))
 
 
 def _ref_addr(ref: Tensor) -> int:
@@ -275,23 +296,279 @@ class TestTorchInterop:
             assert arg.nbytes() == 2 * 4
 
 
+def _f32_bits(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _struct_pack_f_raises(value):
+    """Whether the pre-binding Python encoder refused this float.
+
+    `scalar_to_uint64` used `struct.pack("<f", ...)`, so these tests assert the C++ encoder
+    accepts and refuses the same set rather than hardcoding a range next to it.
+    """
+    try:
+        struct.pack("<f", value)
+    except OverflowError:
+        return True
+    return False
+
+
+def _HOST_ORDER(ctype):  # noqa: N802
+    """The byte-order-qualified variant naming the host's own order."""
+    return ctype.__ctype_le__ if sys.byteorder == "little" else ctype.__ctype_be__
+
+
+def _FOREIGN_ORDER(ctype):  # noqa: N802
+    """The byte-order-qualified variant naming the order the host does not use."""
+    return ctype.__ctype_be__ if sys.byteorder == "little" else ctype.__ctype_le__
+
+
+def _f64_bits(value):
+    return struct.unpack("<Q", struct.pack("<d", value))[0]
+
+
+class _Opcode(enum.IntEnum):
+    IDLE = 0
+    RUN = 7
+
+
+class _MyDouble(ctypes.c_double):
+    """A c_double subclass — must still encode at double precision."""
+
+
+# Every encoding scalar_to_uint64 must produce, as (value, expected bits). These are the
+# same bits C++ to_u64() produces for the same value, which is what lets a slot written
+# from Python and one written from orchestration read back identically.
+#
+# The ctypes rows are the load-bearing ones: a ctypes scalar is read at its own width and
+# ZERO-extended, so c_int8(-1) is 0xFF, matching to_u64(int8_t{-1}). Sign-extending it to
+# 0xFF..FF — which reading `.value` would do — is the divergence these rows exist to catch.
+_ENCODING_CASES = [
+    ("int_zero", 0, 0),
+    ("int_small", 999, 999),
+    ("int_negative_one", -1, 0xFFFFFFFFFFFFFFFF),
+    ("int_int64_min", -(2**63), 0x8000000000000000),
+    ("int_int64_max", 2**63 - 1, 0x7FFFFFFFFFFFFFFF),
+    ("int_uint64_max", 2**64 - 1, 0xFFFFFFFFFFFFFFFF),
+    ("bool_true", True, 1),
+    ("bool_false", False, 0),
+    ("intenum", _Opcode.RUN, 7),
+    ("c_int8_negative", ctypes.c_int8(-1), 0xFF),
+    ("c_int16_negative", ctypes.c_int16(-1), 0xFFFF),
+    ("c_int32_negative", ctypes.c_int32(-1), 0xFFFFFFFF),
+    ("c_int64_negative", ctypes.c_int64(-1), 0xFFFFFFFFFFFFFFFF),
+    ("c_int64_positive", ctypes.c_int64(42), 42),
+    ("c_uint8_max", ctypes.c_uint8(255), 0xFF),
+    ("c_uint64_max", ctypes.c_uint64(2**64 - 1), 0xFFFFFFFFFFFFFFFF),
+    ("c_bool_true", ctypes.c_bool(True), 1),
+    ("c_bool_false", ctypes.c_bool(False), 0),
+    ("c_float", ctypes.c_float(1.5), _f32_bits(1.5)),
+    ("c_double", ctypes.c_double(1.5), _f64_bits(1.5)),
+    # A subclass is still that ctypes type. Dispatching on the type's __name__ would miss
+    # this one and narrow it to single precision.
+    ("c_double_subclass", _MyDouble(1.5), _f64_bits(1.5)),
+    # A bare Python float carries no width, so it narrows. This is the one encoding that
+    # cannot align with its C++ counterpart, where to_u64(1.5) is a double.
+    ("python_float", 1.5, _f32_bits(1.5)),
+    ("python_float_negative", -2.25, _f32_bits(-2.25)),
+]
+
+_ENCODING_IDS = [case[0] for case in _ENCODING_CASES]
+_ENCODING_PARAMS = [(case[1], case[2]) for case in _ENCODING_CASES]
+
+
 class TestScalarToUint64:
-    def test_scalar_to_uint64_int(self):
+    @pytest.mark.parametrize(("value", "expected"), _ENCODING_PARAMS, ids=_ENCODING_IDS)
+    def test_encoding(self, value, expected):
         from simpler.task_interface import scalar_to_uint64
 
-        assert scalar_to_uint64(999) == 999
+        assert scalar_to_uint64(value) == expected
 
-    def test_scalar_to_uint64_ctypes(self):
+    def test_python_float_loses_precision_where_c_double_does_not(self):
         from simpler.task_interface import scalar_to_uint64
 
-        assert scalar_to_uint64(ctypes.c_int64(42)) == 42
+        value = 0.1
+        assert scalar_to_uint64(value) == _f32_bits(value)
+        assert scalar_to_uint64(ctypes.c_double(value)) == _f64_bits(value)
+        assert scalar_to_uint64(value) != scalar_to_uint64(ctypes.c_double(value))
 
-    def test_scalar_to_uint64_float_ctypes(self):
+    def test_numpy_integer_is_accepted(self):
+        np = pytest.importorskip("numpy")
         from simpler.task_interface import scalar_to_uint64
 
-        bits = scalar_to_uint64(ctypes.c_float(1.5))
-        expected_bits = struct.unpack("I", struct.pack("f", 1.5))[0]
-        assert bits == expected_bits
+        assert scalar_to_uint64(np.int64(-1)) == 0xFFFFFFFFFFFFFFFF
+        assert scalar_to_uint64(np.uint32(7)) == 7
+
+    def test_numpy_float64_is_a_python_float_subclass(self):
+        np = pytest.importorskip("numpy")
+        from simpler.task_interface import scalar_to_uint64
+
+        assert scalar_to_uint64(np.float64(1.5)) == _f32_bits(1.5)
+
+    def test_rejects_narrower_numpy_float(self):
+        np = pytest.importorskip("numpy")
+        from simpler.task_interface import scalar_to_uint64
+
+        # np.float32 defines neither __index__ nor float inheritance, so it is refused
+        # rather than silently coerced through int().
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64(np.float32(1.5))
+
+    def test_rejects_non_scalar(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64("7")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ctypes.c_void_p(0x1234),
+            ctypes.c_char_p(b"seven"),
+            ctypes.c_char(b"7"),
+            ctypes.c_wchar("7"),
+        ],
+        ids=["c_void_p", "c_char_p", "c_char", "c_wchar"],
+    )
+    def test_rejects_non_numeric_ctypes(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # These are _SimpleCData subclasses whose buffer holds an address or a character,
+        # not a number. Encoding one would put a host pointer into a device-bound slot.
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64(value)
+
+    def test_accepts_a_subclass_of_an_admitted_ctypes_type(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # Admission reads the buffer's format, which a subclass inherits from its base, so it
+        # is not decided by the type's own name.
+        class _MyInt8(ctypes.c_int8):
+            pass
+
+        assert scalar_to_uint64(_MyInt8(-1)) == 0xFF
+
+    @pytest.mark.parametrize(
+        ("foreign", "native"),
+        [
+            (_FOREIGN_ORDER(ctypes.c_uint32)(1), ctypes.c_uint32(1)),
+            (_FOREIGN_ORDER(ctypes.c_double)(1.5), ctypes.c_double(1.5)),
+        ],
+        ids=["c_uint32", "c_double"],
+    )
+    def test_rejects_a_foreign_byte_order_ctypes_scalar(self, foreign, native):
+        from simpler.task_interface import scalar_to_uint64
+
+        # A byte-order-qualified variant carries the *same* `_type_` as its native counterpart
+        # and differs only in the buffer format's prefix, so `_type_` alone cannot tell them
+        # apart. Its bytes are reversed, so copying them would encode c_uint32.__ctype_be__(1)
+        # as 0x01000000 where to_u64(uint32_t{1}) is 0x1 — a different number for the same
+        # value, which is exactly the bit-for-bit contract this encoder claims.
+        assert type(foreign)._type_ == type(native)._type_
+        assert bytes(memoryview(foreign)) == bytes(reversed(bytes(memoryview(native))))
+        with pytest.raises((TypeError, ValueError)):
+            scalar_to_uint64(foreign)
+
+    def test_accepts_the_host_byte_order_qualified_variant(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # The qualifier naming the host's own order is not foreign, so it encodes like the
+        # unqualified type rather than being refused along with its sibling.
+        assert scalar_to_uint64(_HOST_ORDER(ctypes.c_uint32)(1)) == 1
+
+    @pytest.mark.parametrize(
+        "value",
+        [1e100, -1e100, 3.402823806667635e38, 1e308],
+        ids=["1e100", "-1e100", "just_above_flt_max", "1e308"],
+    )
+    def test_rejects_float_out_of_single_precision_range(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # struct.pack("<f", ...) raised OverflowError for these, and storing the infinity a
+        # narrowing conversion produces would silently be a different number.
+        assert _struct_pack_f_raises(value)
+        with pytest.raises((OverflowError, ValueError)):
+            scalar_to_uint64(value)
+
+    def test_float_range_boundary(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # FLT_MAX itself is in range; the smallest double above it that does not round back
+        # down to it is not.
+        flt_max = 3.4028234663852886e38
+        assert scalar_to_uint64(flt_max) == _f32_bits(flt_max)
+        assert not _struct_pack_f_raises(flt_max)
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf")], ids=["inf", "-inf"])
+    def test_non_finite_float_passes_through(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # An input that is already infinite is not a value that went out of range on the way
+        # in, so it encodes as itself rather than raising.
+        assert scalar_to_uint64(value) == _f32_bits(value)
+
+    def test_nan_float_passes_through(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        bits = scalar_to_uint64(float("nan"))
+        # Exponent all ones with a non-zero mantissa — the payload is not pinned down.
+        assert bits & 0x7F800000 == 0x7F800000
+        assert bits & 0x007FFFFF != 0
+
+    @pytest.mark.parametrize("value", [2**64, -(2**63) - 1, 2**70], ids=["above_u64", "below_i64", "far_above"])
+    def test_rejects_out_of_range_integer(self, value):
+        from simpler.task_interface import scalar_to_uint64
+
+        # Truncating to the low 64 bits would silently store a different number.
+        with pytest.raises((OverflowError, ValueError)):
+            scalar_to_uint64(value)
+
+    def test_propagates_an_exception_raised_by_index(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # __index__ answering with an exception leaves PyNumber_Index at nullptr with that
+        # exception pending. The caller sees its own error, not a crash and not a substitute.
+        class BrokenIndex:
+            def __index__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            scalar_to_uint64(BrokenIndex())
+
+        args = TaskArgs()
+        with pytest.raises(RuntimeError, match="boom"):
+            args.add_scalar(BrokenIndex())
+        assert args.scalar_count() == 0
+
+
+class TestAddScalarEncoding:
+    """add_scalar takes the value itself and encodes it exactly as scalar_to_uint64 does."""
+
+    @pytest.mark.parametrize(("value", "expected"), _ENCODING_PARAMS, ids=_ENCODING_IDS)
+    def test_task_args(self, value, expected):
+        args = TaskArgs()
+        args.add_scalar(value)
+        assert args.scalar(0) == expected
+
+    @pytest.mark.parametrize(("value", "expected"), _ENCODING_PARAMS, ids=_ENCODING_IDS)
+    def test_chip_storage_task_args(self, value, expected):
+        args = ChipStorageTaskArgs()
+        args.add_scalar(value)
+        assert args.scalar(0) == expected
+
+    def test_pre_encoded_uint64_still_round_trips(self):
+        from simpler.task_interface import scalar_to_uint64
+
+        # The pre-encoding spelling stays valid: its result is an int, which passes through.
+        args = TaskArgs()
+        args.add_scalar(scalar_to_uint64(ctypes.c_float(1.5)))
+        assert args.scalar(0) == _f32_bits(1.5)
+
+    def test_rejects_non_scalar(self):
+        args = TaskArgs()
+        with pytest.raises((TypeError, ValueError)):
+            args.add_scalar("7")
+        assert args.scalar_count() == 0
 
 
 # ============================================================================
@@ -475,6 +752,35 @@ class TestTaskArgs:
         args.add_tensor(_dev_ref(0xBEEF, (4, 8), DataType.FLOAT32), TensorArgType.OUTPUT)
         assert args.tag(0) == TensorArgType.OUTPUT
 
+    def test_identities_are_in_argument_order_and_keep_duplicates(self):
+        # The run's touched set is built from this; two views of one backing share an identity, and
+        # dropping the repeat here would make the list disagree with tensor_count().
+        one = _dev_ref(0x1, (4,), DataType.INT32)
+        args = TaskArgs()
+        args.add_tensor(one)
+        args.add_tensor(_dev_ref(0x2, (4,), DataType.INT32))
+        args.add_tensor(one)
+
+        identities = args.identities()
+        assert len(identities) == args.tensor_count() == 3
+        assert identities[0] == one.buffer.identity
+        assert identities[2] == one.buffer.identity
+        assert identities[1] != one.buffer.identity
+
+    def test_has_device_backed_tensor_sees_only_memory_behind_a_chip(self):
+        empty = TaskArgs()
+        assert not empty.has_device_backed_tensor()
+
+        host = TaskArgs()
+        host.add_tensor(_fork_ref(0x1000, (4,), DataType.INT32))
+        assert not host.has_device_backed_tensor()
+
+        # Any one device-backed arg is enough: the whole list then has to be authorized.
+        mixed = TaskArgs()
+        mixed.add_tensor(_fork_ref(0x2000, (4,), DataType.INT32))
+        mixed.add_tensor(_dev_ref(0x3, (4,), DataType.INT32))
+        assert mixed.has_device_backed_tensor()
+
     def test_multiple_refs_with_tags(self):
         args = TaskArgs()
         args.add_tensor(_dev_ref(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
@@ -594,6 +900,89 @@ class TestTaskArgs:
         assert args.scalar_count() == 200
 
 
+class TestProvenanceTable:
+    """The dispatch-path device-allocation table.
+
+    `Worker._child_prov_check_dispatch_locked` turns the reported failure into the ValueError a
+    caller sees; these cover what the table itself decides.
+    """
+
+    @staticmethod
+    def _registered(table, addr=0x1000, owner_worker_id=0):
+        buffer = wrap_device_malloc(addr, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        table.insert(buffer.to_descriptor(), owner_worker_id)
+        return buffer
+
+    def test_a_live_allocation_on_its_own_worker_passes(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table, owner_worker_id=2)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 2) is None
+
+    def test_an_allocation_on_another_worker_is_not_live_here(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table, owner_worker_id=0)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 1) == (0, PROV_NOT_LIVE)
+
+    def test_an_unregistered_identity_is_not_live(self):
+        table = ProvenanceTable()
+        stray = wrap_device_malloc(0x2000, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        args = TaskArgs()
+        args.add_tensor(stray.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (0, PROV_NOT_LIVE)
+
+    def test_a_same_identity_descriptor_that_changed_is_rejected(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table)
+        # The identity still resolves; the extent reaching native does not match the registered one.
+        buffer.nbytes = 32
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((8,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (0, PROV_DESCRIPTOR_MISMATCH)
+
+    def test_the_first_failing_argument_is_the_one_reported(self):
+        table = ProvenanceTable()
+        good = self._registered(table)
+        stray = wrap_device_malloc(0x3000, 64, mint_owner_instance_id(), next(_REF_BID), "L3")
+        args = TaskArgs()
+        args.add_tensor(good.tensor((16,), int(DataType.FLOAT32.value)))
+        args.add_tensor(_fork_ref(0x4000, (4,), DataType.INT32))
+        args.add_tensor(stray.tensor((16,), int(DataType.FLOAT32.value)))
+
+        assert table.check_dispatch(args, 0) == (2, PROV_NOT_LIVE)
+
+    def test_host_backed_args_name_nothing_the_table_holds(self):
+        table = ProvenanceTable()
+        args = TaskArgs()
+        args.add_tensor(_fork_ref(0x5000, (4,), DataType.INT32))
+
+        assert table.check_dispatch(args, 0) is None
+
+    def test_erase_revokes_and_clear_empties(self):
+        table = ProvenanceTable()
+        buffer = self._registered(table)
+        args = TaskArgs()
+        args.add_tensor(buffer.tensor((16,), int(DataType.FLOAT32.value)))
+        assert buffer.identity in table
+        assert len(table) == 1
+
+        table.erase(buffer.identity)
+        assert buffer.identity not in table
+        assert table.check_dispatch(args, 0) == (0, PROV_NOT_LIVE)
+
+        table.erase(buffer.identity)  # revoking twice is not an error
+        self._registered(table)
+        table.clear()
+        assert len(table) == 0
+
+
 class TestRemoteTaskArgsSidecar:
     def test_remote_task_args_is_not_public_api(self):
         assert not hasattr(task_interface_module, "RemoteTaskArgs")
@@ -637,6 +1026,32 @@ class TestRemoteTaskArgsSidecar:
         assert desc.nbytes == 4
         assert desc.remote_addr == 0xCAFE
         assert desc.rkey_or_token == 0xBEEF
+
+    def test_local_tensor_after_remote_ref_keeps_sidecar_indices_aligned(self):
+        # A sidecar list is indexed by tensor position, so a local arg added after a remote one
+        # occupies a slot of its own. Without it, the trailing remote ref would be read as the
+        # descriptor for the local arg.
+        handle = RemoteBufferHandle._from_remote_allocation(
+            worker_id=3,
+            buffer_id=11,
+            generation=2,
+            address_space=RemoteAddressSpace.REMOTE_DEVICE,
+            nbytes=64,
+            remote_addr=0xCAFE,
+            rkey_or_token=0xBEEF,
+        )
+
+        args = TaskArgs()
+        args.add_tensor(_dev_ref(0x1000, (4,), DataType.UINT8), TensorArgType.INPUT)
+        args.add_tensor(RemoteTensorRef(handle=handle, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
+        args.add_tensor(_dev_ref(0x2000, (4,), DataType.UINT8), TensorArgType.INPUT)
+
+        sidecar = _remote_sidecar_for(args)
+        assert sidecar is not None
+        assert len(sidecar.tensors) == args.tensor_count() == 3
+        assert sidecar.tensors[0] is None
+        assert sidecar.tensors[1] is not None and sidecar.tensors[1].present
+        assert sidecar.tensors[2] is None
 
     def test_remote_sidecar_storage_is_bound_to_task_args_lifetime(self):
         gc.collect()
@@ -1138,6 +1553,28 @@ class TestChipCallable:
     def _make_child(self, sig, binary):
         return CoreCallable.build(signature=sig, binary=binary)
 
+    @pytest.mark.parametrize("child_count", [1025, 1427, ChipCallable.MAX_CHILDREN - 1, ChipCallable.MAX_CHILDREN])
+    def test_large_child_count(self, child_count):
+        child = self._make_child([], b"\x01")
+        chip = ChipCallable.build(
+            signature=[],
+            func_name="large",
+            binary=b"",
+            children=[(index, child) for index in range(child_count)],
+        )
+        assert chip.child_count == child_count
+        assert chip.child_func_id(child_count - 1) == child_count - 1
+
+    def test_child_count_overflow(self):
+        child = self._make_child([], b"\x01")
+        with pytest.raises(ValueError, match="child_count exceeds MaxChildren"):
+            ChipCallable.build(
+                signature=[],
+                func_name="overflow",
+                binary=b"",
+                children=[(index, child) for index in range(ChipCallable.MAX_CHILDREN + 1)],
+            )
+
     def test_signature_capacity(self):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN] * 256,
@@ -1248,6 +1685,50 @@ class TestChipCallable:
         assert "ChipCallable" in r
         assert "sig_count=2" in r
         assert "child_count=1" in r
+
+    def test_scalar_count_without_scalars_is_zero(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN],
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        assert chip.scalar_count == 0
+
+    def test_scalar_count_derived_from_signature(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.OUT] + [ArgDirection.SCALAR] * 5,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        assert chip.scalar_count == 5
+
+    def test_scalar_count_survives_from_bytes(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN] + [ArgDirection.SCALAR] * 7,
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        raw = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+        clone = ChipCallable.from_bytes(raw)
+        assert clone.scalar_count == 7
+
+    @pytest.mark.parametrize("signature_count", [-1, 257])
+    def test_scalar_count_rejects_corrupt_cached_signature_count(self, signature_count):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.SCALAR],
+            func_name="test_func",
+            binary=b"\x00",
+            children=[],
+        )
+        raw = bytearray(ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size())))
+        # The wire signature contains 256 int32 ArgDirection entries before sig_count.
+        struct.pack_into("<i", raw, 256 * struct.calcsize("<i"), signature_count)
+        clone = ChipCallable.from_bytes(bytes(raw))
+        with pytest.raises(ValueError, match=rf"signature count {signature_count}.*256"):
+            _ = clone.scalar_count
 
 
 # ============================================================================

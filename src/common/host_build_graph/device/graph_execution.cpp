@@ -14,19 +14,21 @@
 #include <algorithm>
 #include <cstring>
 
+#include "graph_image_view.h"
 #include "host_build_graph/task_id.h"
 
 namespace {
 
 GraphExecution *acquire_execution_storage(
-    uintptr_t storage_addr, size_t storage_bytes, int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count
+    uintptr_t storage_addr, size_t storage_bytes, int32_t task_count, int32_t tensor_arg_count,
+    int32_t scalar_arg_count, int32_t edge_count
 ) {
     GraphExecutionStorageLayout layout{};
-    // ChipTaskStorage, not GraphExecution: the in-graph task array's alignment is the widest
+    // ChipTaskStorage, not GraphExecution: the sub-task array's alignment is the widest
     // the storage carries, and tasks_offset only rounds up relative to this base, so
-    // an under-aligned base would leave every alignas(64) in-graph task entry misaligned.
+    // an under-aligned base would leave every alignas(64) sub-task entry misaligned.
     if (storage_addr == 0 || storage_addr % alignof(ChipTaskStorage) != 0 ||
-        !graph_execution_storage_layout(task_count, tensor_arg_count, scalar_arg_count, &layout) ||
+        !graph_execution_storage_layout(task_count, tensor_arg_count, scalar_arg_count, edge_count, &layout) ||
         layout.total_bytes > storage_bytes) {
         return nullptr;
     }
@@ -37,6 +39,15 @@ GraphExecution *acquire_execution_storage(
     execution->task_storage = reinterpret_cast<ChipTaskStorage *>(base + layout.tasks_offset);
     execution->task_tensor_pool = reinterpret_cast<simpler::hbg::Tensor *>(base + layout.tensors_offset);
     execution->task_scalar_pool = reinterpret_cast<uint64_t *>(base + layout.scalars_offset);
+    // The execution's own fanin CSR. bind_graph_topology fills it out of the
+    // reading thread's section and validates what it wrote; until then the rows
+    // are the storage's zeroes and no scan runs, because the slot's
+    // graph_context is not published before localize returns.
+    execution->fanin_offsets = reinterpret_cast<int32_t *>(base + layout.fanin_offsets_offset);
+    execution->fanin_indices =
+        edge_count == 0 ? nullptr : reinterpret_cast<uint16_t *>(base + layout.fanin_indices_offset);
+    execution->edge_count = edge_count;
+    execution->task_states = reinterpret_cast<std::atomic<ChipTaskState> *>(base + layout.states_offset);
     return execution;
 }
 
@@ -53,53 +64,74 @@ void reset_graph_payload(TaskPayload &payload) {
     payload.early_sync_drain_state.store(EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
 }
 
-bool bind_graph_topology(GraphExecution &execution) {
-    if (execution.definition == nullptr) return false;
-    const GraphDefinition &definition = *execution.definition;
+// Validate this Graph's topology and take the fanin CSR into the execution's own
+// storage.
+//
+// Every read is a bounded copy out of `image` into a local: the section is the
+// calling thread's launch arguments, which no other thread may address and which
+// carry no alignment guarantee. The fanin rows and indices are validated from the
+// execution's copy rather than from the section, because that copy is what every
+// later scan reads — a check against the source would leave the copy unproven.
+bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image, const GraphDefinitionValue &object) {
+    const GraphDefinition &definition = object.definition;
     // Re-checked rather than inherited from graph_execution_localize: every section
     // below is fetched with task_count or task_count + 1, so a wire value outside this
     // range overflows the increment before any bound check can see it.
-    if (definition.task_count <= 0 || definition.task_count > MAX_IN_GRAPH_TASKS) return false;
+    if (definition.task_count <= 0 || definition.task_count > SUB_TASK_MAX_NUM) return false;
+    if (definition.edge_count < 0 || definition.root_count < 0) return false;
     // GRAPH_MAX_SCALAR_ARGS, not MAX_SCALAR_ARGS: this counts the scalars the
-    // Graph BOUNDARY carries, which the recorder sizes with
-    // GraphTaskArgs = Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> and the
-    // outer Graph payload hands it to GraphExecution, never through an in-graph task
+    // Graph BOUNDARY carries, which the recorder sizes with GraphTaskArgs and the
+    // outer Graph payload hands it to GraphExecution, never through a sub-task
     // payload. MAX_SCALAR_ARGS is the per-AICore-task cap (16) and applies to
-    // InGraphTaskDefinition::scalar_count below, which is checked separately; using
+    // SubTaskDefinition::scalar_count below, which is checked separately; using
     // it here rejected every boundary wider than one kernel call could take.
     if (definition.boundary_scalar_count > GRAPH_MAX_SCALAR_ARGS) return false;
-    const int32_t *fanin_offsets =
-        graph_definition_array<int32_t>(definition, definition.off_fanin_offsets, definition.task_count + 1);
-    const uint16_t *fanin_indices =
-        definition.edge_count == 0 ?
-            nullptr :
-            graph_definition_array<uint16_t>(definition, definition.off_fanin_indices, definition.edge_count);
-    const int32_t *fanout_offsets =
-        graph_definition_array<int32_t>(definition, definition.off_fanout_offsets, definition.task_count + 1);
-    const uint16_t *fanout_indices =
-        definition.edge_count == 0 ?
-            nullptr :
-            graph_definition_array<uint16_t>(definition, definition.off_fanout_indices, definition.edge_count);
-    const uint16_t *roots =
-        graph_definition_array<uint16_t>(definition, definition.off_root_indices, definition.root_count);
-    const InGraphTaskDefinition *tasks =
-        graph_definition_array<InGraphTaskDefinition>(definition, definition.off_in_graph_tasks, definition.task_count);
-    const uint64_t *in_graph_task_offsets =
-        graph_definition_array<uint64_t>(definition, definition.off_in_graph_task_offsets, definition.task_count);
-    if (fanin_offsets == nullptr || fanout_offsets == nullptr || roots == nullptr || tasks == nullptr ||
-        in_graph_task_offsets == nullptr ||
-        (definition.edge_count != 0 && (fanin_indices == nullptr || fanout_indices == nullptr)) ||
-        fanin_offsets[0] != 0 || fanout_offsets[0] != 0 ||
-        fanin_offsets[definition.task_count] != definition.edge_count ||
-        fanout_offsets[definition.task_count] != definition.edge_count) {
+    if (execution.fanin_offsets == nullptr || execution.edge_count != definition.edge_count) return false;
+    if (definition.edge_count != 0 && execution.fanin_indices == nullptr) return false;
+
+    // The rows and indices this execution will read for the rest of the run.
+    int32_t *rows = execution.fanin_offsets;
+    uint16_t *indices = execution.fanin_indices;
+    if (!graph_definition_copy_array<int32_t>(
+            image, object, definition.off_fanin_offsets, definition.task_count + 1, rows
+        )) {
+        return false;
+    }
+    if (definition.edge_count != 0 && !graph_definition_copy_array<uint16_t>(
+                                          image, object, definition.off_fanin_indices, definition.edge_count, indices
+                                      )) {
+        return false;
+    }
+
+    int32_t fanout_first = 0;
+    int32_t fanout_last = 0;
+    if (!graph_definition_load_element<int32_t>(
+            image, object, definition.off_fanout_offsets, definition.task_count + 1, 0, &fanout_first
+        ) ||
+        !graph_definition_load_element<int32_t>(
+            image, object, definition.off_fanout_offsets, definition.task_count + 1, definition.task_count, &fanout_last
+        )) {
+        return false;
+    }
+    if (rows[0] != 0 || fanout_first != 0 || rows[definition.task_count] != definition.edge_count ||
+        fanout_last != definition.edge_count) {
         return false;
     }
 
     uint64_t required_heap = 0;
     constexpr uint8_t VALID_ACTIVE_MASK = (1U << SUBTASK_SLOT_COUNT) - 1U;
     for (int32_t i = 0; i < definition.task_count; ++i) {
-        const InGraphTaskDefinition &task = tasks[i];
-        if (in_graph_task_offsets[i] != required_heap || task.total_output_size < 0 || task.tensor_count < 0 ||
+        SubTaskDefinition task{};
+        uint64_t sub_task_offset = 0;
+        if (!graph_definition_load_element<SubTaskDefinition>(
+                image, object, definition.off_sub_tasks, definition.task_count, i, &task
+            ) ||
+            !graph_definition_load_element<uint64_t>(
+                image, object, definition.off_sub_task_offsets, definition.task_count, i, &sub_task_offset
+            )) {
+            return false;
+        }
+        if (sub_task_offset != required_heap || task.total_output_size < 0 || task.tensor_count < 0 ||
             task.tensor_count > MAX_TENSOR_ARGS || task.scalar_count < 0 || task.scalar_count > MAX_SCALAR_ARGS ||
             // Negative before the span tests, which cannot see it on their own: a
             // negative offset is below tensor_arg_count and *widens* the remaining
@@ -108,8 +140,9 @@ bool bind_graph_topology(GraphExecution &execution) {
             task.tensor_count > definition.tensor_arg_count - task.tensor_offset ||
             task.scalar_offset > definition.scalar_arg_count ||
             task.scalar_count > definition.scalar_arg_count - task.scalar_offset ||
-            (task.active_mask & ~VALID_ACTIVE_MASK) != 0 || task.logical_block_num <= 0 ||
-            task.total_required_subtasks < 0) {
+            (task.active_mask & ~VALID_ACTIVE_MASK) != 0 ||
+            (task.ed_flags & ~(ED_FLAG_CANDIDATE | ED_FLAG_TRACKED)) != 0 || task.reserved != 0 ||
+            task.logical_block_num <= 0 || task.total_required_subtasks < 0) {
             return false;
         }
         for (int32_t slot = 0; slot < SUBTASK_SLOT_COUNT; ++slot) {
@@ -124,99 +157,106 @@ bool bind_graph_topology(GraphExecution &execution) {
 
     int32_t observed_roots = 0;
     for (int32_t consumer = 0; consumer < definition.task_count; ++consumer) {
-        const int32_t begin = fanin_offsets[consumer];
-        const int32_t end = fanin_offsets[consumer + 1];
-        if (begin > end || end > definition.edge_count) return false;
+        const int32_t begin = rows[consumer];
+        const int32_t end = rows[consumer + 1];
+        if (begin < 0 || begin > end || end > definition.edge_count) return false;
         if (begin == end) observed_roots++;
+        // ED_FLAG_CANDIDATE steers dispatch from materialization onward, so the
+        // image must carry the whole conjunction the recorder decided it by, not
+        // merely a known bit: a candidate with no producer has nothing to bet on,
+        // a DUMMY one would index early_dispatch_queues[] one past its last
+        // shape, and a predicated one would be released before its predicate is
+        // ever tested. graph_fill_definition is the only writer of this field and
+        // holds all three, so a violation means the image is not one it produced.
+        SubTaskDefinition consumer_task{};
+        if (!graph_definition_load_element<SubTaskDefinition>(
+                image, object, definition.off_sub_tasks, definition.task_count, consumer, &consumer_task
+            )) {
+            return false;
+        }
+        if ((consumer_task.ed_flags & ED_FLAG_CANDIDATE) != 0 &&
+            (begin == end || consumer_task.predicate_slot != 0 ||
+             ActiveMask(consumer_task.active_mask).to_shape() == ResourceShape::DUMMY)) {
+            return false;
+        }
         for (int32_t edge = begin; edge < end; ++edge) {
-            if (fanin_indices[edge] >= consumer) return false;
+            if (indices[edge] >= consumer) return false;
         }
     }
     if (observed_roots != definition.root_count) return false;
     for (int32_t i = 0; i < definition.root_count; ++i) {
-        const uint16_t root = roots[i];
-        if (root >= definition.task_count || fanin_offsets[root] != fanin_offsets[root + 1]) return false;
+        uint16_t root = 0;
+        if (!graph_definition_load_element<uint16_t>(
+                image, object, definition.off_root_indices, definition.root_count, i, &root
+            )) {
+            return false;
+        }
+        if (root >= definition.task_count || rows[root] != rows[root + 1]) return false;
     }
     for (int32_t producer = 0; producer < definition.task_count; ++producer) {
-        const int32_t begin = fanout_offsets[producer];
-        const int32_t end = fanout_offsets[producer + 1];
-        if (begin > end || end > definition.edge_count) return false;
+        int32_t begin = 0;
+        int32_t end = 0;
+        if (!graph_definition_load_element<int32_t>(
+                image, object, definition.off_fanout_offsets, definition.task_count + 1, producer, &begin
+            ) ||
+            !graph_definition_load_element<int32_t>(
+                image, object, definition.off_fanout_offsets, definition.task_count + 1, producer + 1, &end
+            )) {
+            return false;
+        }
+        if (begin < 0 || begin > end || end > definition.edge_count) return false;
         for (int32_t edge = begin; edge < end; ++edge) {
-            if (fanout_indices[edge] <= producer || fanout_indices[edge] >= definition.task_count) return false;
+            uint16_t consumer = 0;
+            if (!graph_definition_load_element<uint16_t>(
+                    image, object, definition.off_fanout_indices, definition.edge_count, edge, &consumer
+                )) {
+                return false;
+            }
+            if (consumer <= producer || consumer >= definition.task_count) return false;
         }
     }
-
-    execution.fanin_offsets = fanin_offsets;
-    execution.fanin_indices = fanin_indices;
     return true;
 }
 
-// Framing gate for a shared Definition object: the header must agree with the image
-// behind it before any of the image's section offsets is read. Framing, not
-// integrity — every section is fetched through graph_definition_array, which bounds
-// its offset, alignment and extent against total_bytes, and bind_graph_topology
-// below walks the whole edge list; neither trusts a field this returns.
+// Rebuild one recorded tensor for this execution. A recorded tensor is a relocation
+// record, not a tensor: the two fields replay has a base for are stored relative, and
+// this is where the base is added. Which base follows the owner:
 //
-// definition_bytes is what the upload recorded for this object, so comparing it
-// against the image's own total_bytes is what rejects a header framing a region
-// that does not hold the Definition it claims.
-GraphDefinition *graph_definition_object_framed(GraphDefinitionHeader &header) {
-    if (header.magic != GRAPH_DEFINITION_OBJECT_MAGIC) return nullptr;
-    if (header.definition_bytes < sizeof(GraphDefinition)) return nullptr;
-    auto *definition = reinterpret_cast<GraphDefinition *>(&header + 1);
-    if (definition->total_bytes != header.definition_bytes) return nullptr;
-    if (definition->full_key != header.full_key) return nullptr;
-    return definition;
-}
-
-// Rebind one Definition tensor template onto this execution. A BOUNDARY_* ref
-// takes the invocation's boundary tensor; an INTERNAL / OWN_OUTPUT ref takes the
-// producer in-graph task's materialized output base. `task_index` is the consuming
-// task, which bounds a producer reference to a task that is already constructed.
-// Returns false when the ref addresses no valid source — the Definition is then
-// invalid, since every ref is written by the recorder from a classified source.
+//   a parameter    buffer comes whole from this call's argument, and `start_offset` is
+//                  the view's own offset inside that parameter, so the argument's origin
+//                  is added to it
+//   a body tensor  buffer address is an offset into the graph heap, whose base this
+//                  execution was given; `start_offset` is already its own view origin
+//
+// Everything else travels absolute, because graph_require_boundary_match pins it equal
+// before a Definition may be reused. owner_task_id and version are not touched either --
+// nothing on the device reads them off a task's arguments, the scheduler hands the kernel a
+// Tensor
+// pointer and the body's dependencies come from the Definition's CSR.
+//
+// Adding the parameter's *own* origin, rather than a partition-wide shift, is what makes
+// this hold even when a boundary slipped through the arrangement check: each tensor is
+// rebuilt against the parameter it actually came from.
+//
+// The values themselves were checked where they were produced: the recorder resolved each
+// tensor against the parameter or the producing block it actually came from, and refused
+// the body otherwise. What is checked here is only what indexes an array of this
+// execution.
 bool graph_rebind_tensor(
-    const GraphExecution &execution, const InGraphTaskDefinition *tasks, const uint64_t *in_graph_task_offsets,
-    const GraphTensor &tensor_template, const GraphTensorSourceRef &ref, int32_t task_index, GraphTensor *rebound_out
+    const GraphExecution &execution, const simpler::hbg::TensorData &tensor_template, simpler::hbg::Tensor *rebound_out
 ) {
-    GraphTensor rebound = tensor_template;
-    if (!graph_tensor_wire_valid(rebound)) return false;
-    if (ref.source_kind == static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_EXACT)) {
-        if (ref.source_index >= execution.boundary_tensor_count || ref.packed_offset != 0) return false;
-        rebound = execution.boundary_tensors[ref.source_index];
-    } else if (ref.source_kind == static_cast<uint8_t>(GraphTensorSourceKind::BOUNDARY_VIEW)) {
-        if (ref.source_index >= execution.boundary_tensor_count) return false;
-        const GraphTensor &boundary = execution.boundary_tensors[ref.source_index];
-        if (ref.packed_offset > UINT64_MAX - boundary.start_offset) return false;
-        rebound.buffer_addr = boundary.buffer_addr;
-        rebound.buffer_size = boundary.buffer_size;
-        rebound.owner_task_id = boundary.owner_task_id;
-        rebound.start_offset = boundary.start_offset + ref.packed_offset;
-        rebound.version = boundary.version;
-        rebound.address_space = boundary.address_space;
-    } else if (ref.source_kind == static_cast<uint8_t>(GraphTensorSourceKind::INTERNAL) ||
-               ref.source_kind == static_cast<uint8_t>(GraphTensorSourceKind::OWN_OUTPUT)) {
-        const bool own_output = ref.source_kind == static_cast<uint8_t>(GraphTensorSourceKind::OWN_OUTPUT);
-        const int32_t producer_index = own_output ? task_index : static_cast<int32_t>(ref.source_index);
-        if (producer_index < 0 || producer_index > task_index || (own_output && ref.source_index != task_index) ||
-            (!own_output && producer_index == task_index)) {
-            return false;
-        }
-        TaskDescriptor &producer = execution.task_at(producer_index).task;
-        const uint64_t producer_bytes = static_cast<uint64_t>(tasks[producer_index].total_output_size);
-        const uintptr_t producer_base = reinterpret_cast<uintptr_t>(producer.packed_buffer_base);
-        if (ref.packed_offset > producer_bytes || rebound.buffer_size > producer_bytes - ref.packed_offset ||
-            ref.packed_offset > UINTPTR_MAX - producer_base ||
-            ref.packed_offset > UINT64_MAX - in_graph_task_offsets[producer_index]) {
-            return false;
-        }
-        rebound.buffer_addr = producer_base + ref.packed_offset;
-        rebound.owner_task_id = producer.task_id.raw;
+    rebound_out->init_from(tensor_template);
+    const TaskId owner = rebound_out->owner_task_id;
+    if (owner.space() == TaskId::Space::PARAM) {
+        const int32_t param_index = owner.local_id();
+        if (param_index < 0 || param_index >= execution.boundary_tensor_count) return false;
+        const simpler::hbg::Tensor &boundary = execution.boundary_tensors[param_index];
+        rebound_out->buffer = boundary.buffer;
+        rebound_out->start_offset += boundary.start_offset;
+        rebound_out->address_space = boundary.address_space;
     } else {
-        return false;
+        rebound_out->buffer.addr += execution.heap_base;
     }
-    if (!graph_tensor_wire_valid(rebound)) return false;
-    *rebound_out = rebound;
     return true;
 }
 
@@ -228,7 +268,7 @@ bool graph_rebind_tensor(
 // range-checked here: pass() memcpys elem_size bytes into an int64_t, and the
 // address must land inside the operand's own buffer.
 bool graph_predicate_resolve(
-    const GraphTensor &operand, const GraphPredicate &predicate, DispatchPredicate *resolved_out
+    const simpler::hbg::Tensor &operand, const GraphPredicate &predicate, DispatchPredicate *resolved_out
 ) {
     // pass() treats an operator it does not recognize as "always dispatch", so an
     // unknown code from the image must not reach it. Enumerating the operators
@@ -248,14 +288,15 @@ bool graph_predicate_resolve(
         break;
     }
     if (!operator_known) return false;
-    const uint64_t element_size = get_element_size(static_cast<DataType>(operand.dtype));
+    const uint64_t element_size = get_element_size(operand.dtype);
     if (element_size != 1 && element_size != 2 && element_size != 4 && element_size != 8) return false;
-    if (predicate.elem_size != element_size || predicate.elem_offset >= operand.extent_elem) return false;
-    // graph_tensor_wire_valid bounds start_offset + extent_elem by the buffer's
-    // element count, so the scaled sum cannot leave the buffer.
+    if (predicate.elem_size != element_size || predicate.elem_offset >= operand.extent_elem_cache) return false;
+    // The recorder bounded elem_offset by the operand's own extent. That the extent itself
+    // lies inside the operand's buffer is a property of the well-formed tensor the caller
+    // passed, so the scaled sum stays inside the buffer this resolves against.
     const uint64_t byte_offset = (operand.start_offset + predicate.elem_offset) * element_size;
 
-    resolved_out->addr = operand.buffer_addr + byte_offset;
+    resolved_out->addr = operand.buffer.addr + byte_offset;
     resolved_out->target = predicate.target;
     resolved_out->elem_size = predicate.elem_size;
     resolved_out->op = static_cast<PredicateOp>(predicate.op);
@@ -264,24 +305,24 @@ bool graph_predicate_resolve(
 
 }  // namespace
 
-GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot) {
+GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot, const GraphImageView &image) {
     if (outer_slot.task_kind != TaskKind::GRAPH || outer_slot.to_descriptor().packed_buffer_base == nullptr ||
-        outer_slot.to_descriptor().packed_buffer_end == nullptr || outer_slot.graph_context == nullptr) {
+        outer_slot.to_descriptor().packed_buffer_end == nullptr) {
         return nullptr;
     }
 
-    const uintptr_t definition_addr = reinterpret_cast<uintptr_t>(outer_slot.graph_context);
-    if (definition_addr < sizeof(GraphDefinitionHeader) ||
-        (definition_addr - sizeof(GraphDefinitionHeader)) % alignof(GraphDefinitionHeader) != 0) {
+    // The descriptor names the Definition by its offset inside this run's
+    // section; the bytes are reached through the caller's own view of that
+    // section and never through an address any other thread could hold.
+    GraphDefinitionValue object{};
+    if (!graph_definition_decode_framed(image, outer_slot.to_descriptor().graph_definition_offset, &object)) {
         return nullptr;
     }
-    auto *definition_header =
-        reinterpret_cast<GraphDefinitionHeader *>(definition_addr - sizeof(GraphDefinitionHeader));
-    const GraphDefinition *definition = graph_definition_object_framed(*definition_header);
+    const GraphDefinition &definition = object.definition;
     TaskPayload &payload = outer_slot.to_payload();
-    if (definition == nullptr || definition->total_bytes == 0 || definition->task_count <= 0 ||
-        definition->task_count > MAX_IN_GRAPH_TASKS || payload.tensor_count != definition->boundary_count ||
-        payload.scalar_count != definition->boundary_scalar_count ||
+    if (definition.total_bytes == 0 || definition.task_count <= 0 || definition.task_count > SUB_TASK_MAX_NUM ||
+        payload.tensor_count != definition.boundary_tensor_count ||
+        payload.scalar_count != definition.boundary_scalar_count ||
         (payload.tensor_count != 0 && payload.tensor_data() == nullptr) ||
         (payload.scalar_count != 0 && payload.scalar_data() == nullptr)) {
         return nullptr;
@@ -289,24 +330,27 @@ GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot) {
 
     const uintptr_t outer_base = reinterpret_cast<uintptr_t>(outer_slot.to_descriptor().packed_buffer_base);
     const uintptr_t outer_end = reinterpret_cast<uintptr_t>(outer_slot.to_descriptor().packed_buffer_end);
-    if (outer_end < outer_base || definition->required_heap > UINTPTR_MAX - outer_base ||
-        definition->execution_storage_bytes > outer_end - outer_base ||
-        definition->required_heap > outer_end - outer_base - definition->execution_storage_bytes) {
+    if (outer_end < outer_base || definition.required_heap > UINTPTR_MAX - outer_base ||
+        definition.execution_storage_bytes > outer_end - outer_base ||
+        definition.required_heap > outer_end - outer_base - definition.execution_storage_bytes) {
         return nullptr;
     }
     GraphExecution *execution = acquire_execution_storage(
-        outer_base + definition->required_heap, definition->execution_storage_bytes, definition->task_count,
-        definition->tensor_arg_count, definition->scalar_arg_count
+        outer_base + definition.required_heap, definition.execution_storage_bytes, definition.task_count,
+        definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count
     );
     if (execution == nullptr) return nullptr;
 
-    execution->definition = definition;
+    execution->definition_offset = object.image_offset;
     execution->outer_slot = &outer_slot;
-    execution->boundary_tensors = reinterpret_cast<const GraphTensor *>(payload.tensor_data());
+    // Checked just above: required_heap fits between outer_base and outer_end, so every
+    // offset a body tensor carries resolves inside the region this Graph was given.
+    execution->heap_base = outer_base;
+    execution->boundary_tensors = payload.tensor_data();
     execution->boundary_tensor_count = payload.tensor_count;
     execution->boundary_scalars = payload.scalar_data();
     execution->boundary_scalar_count = payload.scalar_count;
-    if (!bind_graph_topology(*execution)) {
+    if (!bind_graph_topology(*execution, image, object)) {
         execution->retired_tasks.store(execution->task_count, std::memory_order_relaxed);
         graph_execution_mark_completed(*execution);
         return nullptr;
@@ -316,16 +360,24 @@ GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot) {
 }
 
 GraphMaterializeResult graph_execution_materialize_slice(
-    ChipTaskSlotState &outer_slot, GraphExecution &execution, int32_t max_tasks, int32_t *tasks_materialized
+    ChipTaskSlotState &outer_slot, GraphExecution &execution, const GraphImageView &image, int32_t max_tasks,
+    int32_t *tasks_materialized
 ) {
     if (tasks_materialized != nullptr) *tasks_materialized = 0;
     if (outer_slot.task_kind != TaskKind::GRAPH || outer_slot.to_descriptor().packed_buffer_base == nullptr ||
-        max_tasks <= 0 || execution.definition == nullptr || execution.task_storage == nullptr) {
+        max_tasks <= 0 || execution.definition_offset == 0 || execution.task_storage == nullptr) {
+        return GraphMaterializeResult::INVALID;
+    }
+    // Decoded again here, from this thread's own view: a slice may run on a
+    // thread that did not localize this Graph, and the framing is what makes the
+    // offset shared state carries usable against a section this thread holds.
+    GraphDefinitionValue object{};
+    if (!graph_definition_decode_framed(image, execution.definition_offset, &object)) {
         return GraphMaterializeResult::INVALID;
     }
 
-    GraphExecutionState state = graph_execution_state(execution);
-    if (state >= GraphExecutionState::PREPARED) return GraphMaterializeResult::PREPARED;
+    const GraphExecutionPhase phase = graph_execution_phase(execution);
+    if (phase >= GraphExecutionPhase::MATERIALIZED) return GraphMaterializeResult::MATERIALIZED;
 
     uint8_t expected_busy = 0;
     if (!execution.materialize_busy.compare_exchange_strong(
@@ -334,56 +386,16 @@ GraphMaterializeResult graph_execution_materialize_slice(
         return GraphMaterializeResult::BUSY;
     }
 
-    state = graph_execution_state(execution);
-    if (state == GraphExecutionState::SUBMITTED) {
-        if (!graph_execution_transition(
-                execution, GraphExecutionState::SUBMITTED, GraphExecutionState::MATERIALIZING
-            )) {
-            execution.materialize_busy.store(0, std::memory_order_release);
-            return GraphMaterializeResult::BUSY;
-        }
-        // Incremental activation reads producer slots through execution.tasks
-        // while the graph is still materializing, so publish the storage base
-        // once, before the first range. Topological task order guarantees every
-        // producer index a materialized task references is already constructed,
-        // and materialize_busy serializes this with any concurrent slice.
-        execution.tasks = execution.task_storage;
-    } else if (state != GraphExecutionState::MATERIALIZING) {
+    if (graph_execution_phase(execution) != GraphExecutionPhase::SUBMITTED) {
         execution.materialize_busy.store(0, std::memory_order_release);
-        return GraphMaterializeResult::INVALID;
+        return GraphMaterializeResult::MATERIALIZED;
     }
 
-    const GraphDefinition &definition = *execution.definition;
-    const InGraphTaskDefinition *tasks =
-        graph_definition_array<InGraphTaskDefinition>(definition, definition.off_in_graph_tasks, definition.task_count);
-    const uint64_t *in_graph_task_offsets =
-        graph_definition_array<uint64_t>(definition, definition.off_in_graph_task_offsets, definition.task_count);
-    const GraphTensor *definition_tensors =
-        definition.tensor_arg_count == 0 ?
-            nullptr :
-            graph_definition_array<GraphTensor>(definition, definition.off_tensors, definition.tensor_arg_count);
-    const GraphTensorSourceRef *tensor_sources =
-        definition.tensor_arg_count == 0 ? nullptr :
-                                           graph_definition_array<GraphTensorSourceRef>(
-                                               definition, definition.off_tensor_sources, definition.tensor_arg_count
-                                           );
-    const uint64_t *definition_scalars =
-        definition.scalar_arg_count == 0 ?
-            nullptr :
-            graph_definition_array<uint64_t>(definition, definition.off_scalars, definition.scalar_arg_count);
-    const GraphScalarSourceRef *scalar_sources =
-        definition.scalar_arg_count == 0 ? nullptr :
-                                           graph_definition_array<GraphScalarSourceRef>(
-                                               definition, definition.off_scalar_sources, definition.scalar_arg_count
-                                           );
-    const GraphPredicate *predicates =
-        definition.predicate_count == 0 ?
-            nullptr :
-            graph_definition_array<GraphPredicate>(definition, definition.off_predicates, definition.predicate_count);
-    if (tasks == nullptr || in_graph_task_offsets == nullptr ||
-        (definition.tensor_arg_count != 0 && (definition_tensors == nullptr || tensor_sources == nullptr)) ||
-        (definition.scalar_arg_count != 0 && (definition_scalars == nullptr || scalar_sources == nullptr)) ||
-        (definition.predicate_count != 0 && predicates == nullptr)) {
+    // Every section below is read one element at a time out of `image`, each read
+    // bounded against its array, this Definition and the whole section, so no
+    // array pointer into the package exists to outlive this call.
+    const GraphDefinition &definition = object.definition;
+    if (definition.task_count != execution.task_count) {
         execution.materialize_busy.store(0, std::memory_order_release);
         return GraphMaterializeResult::INVALID;
     }
@@ -391,6 +403,12 @@ GraphMaterializeResult graph_execution_materialize_slice(
     const int32_t first = execution.materialized_tasks;
     const int32_t last = std::min(execution.task_count, first + max_tasks);
     const uintptr_t outer_base = reinterpret_cast<uintptr_t>(outer_slot.to_descriptor().packed_buffer_base);
+    // stage_graph_roots_early is the only path that gives a body root a staging
+    // claim, and it runs only when the shell itself is released early, so under
+    // a shell the host did not qualify no root can ever be staged. The shell's
+    // verdict is written by the host before upload and never changes, so this is
+    // loop-invariant for the whole execution.
+    const bool shell_stages_roots = (outer_slot.ed_flags & ED_FLAG_CANDIDATE) != 0;
     for (int32_t i = first; i < last; ++i) {
         ChipTaskStorage *storage = &execution.task_at(i);
         if (i >= execution.constructed_tasks) {
@@ -401,9 +419,18 @@ GraphMaterializeResult graph_execution_materialize_slice(
         TaskPayload &payload = storage->payload;
         ChipTaskSlotState &slot = storage->slot;
 
-        task.task_id = TaskId::make_in_graph(outer_slot.to_descriptor().task_id.local_id(), i);
-        const InGraphTaskDefinition &source = tasks[i];
-        const uint64_t task_offset = in_graph_task_offsets[i];
+        task.task_id = TaskId::make_sub_task(outer_slot.to_descriptor().task_id.local_id(), i);
+        SubTaskDefinition source{};
+        uint64_t task_offset = 0;
+        if (!graph_definition_load_element<SubTaskDefinition>(
+                image, object, definition.off_sub_tasks, definition.task_count, i, &source
+            ) ||
+            !graph_definition_load_element<uint64_t>(
+                image, object, definition.off_sub_task_offsets, definition.task_count, i, &task_offset
+            )) {
+            execution.materialize_busy.store(0, std::memory_order_release);
+            return GraphMaterializeResult::INVALID;
+        }
         const uint64_t output_bytes = CHIP_ALIGN_UP(static_cast<uint64_t>(source.total_output_size), CHIP_ALIGN_SIZE);
         for (int k = 0; k < SUBTASK_SLOT_COUNT; ++k)
             task.kernel_id[k] = source.kernel_id[k];
@@ -411,15 +438,42 @@ GraphMaterializeResult graph_execution_materialize_slice(
         task.packed_buffer_end = reinterpret_cast<void *>(outer_base + task_offset + output_bytes);
 
         slot.reset_for_reuse();
-        slot.task_state.store(CHIP_TASK_PENDING, std::memory_order_relaxed);
+        // The readiness a consumer polls, cleared before this task becomes
+        // visible to one: materialization publishes tasks incrementally, so a
+        // peer may scan this index as soon as published_tasks passes it.
+        execution.reset_task_state(i);
         slot.active_mask = ActiveMask(source.active_mask);
         slot.task_attrs = TaskAttrs(source.task_attrs);
+        // Recording decided these once for the whole body; every execution of the
+        // same Definition qualifies the same tasks, so materialization only
+        // replays the verdict.
+        slot.ed_flags = source.ed_flags;
         slot.total_required_subtasks = source.total_required_subtasks;
         slot.logical_block_num = source.logical_block_num;
-        slot.in_graph_local_id = i;
+        slot.sub_task_local_id = i;
         // A task in a Graph body is an ordinary leaf, classified by the same rule as
         // one submitted outside a Graph. Its membership is carried by graph_context.
         slot.task_kind = slot.active_mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL;
+        // A root carries no recorded verdict — qualification needs a producer to
+        // bet on and a root has none inside the body — but an early-released
+        // shell stages roots on the body's behalf, and push_ready_routed reads
+        // this flag to decide whether a task may hold a staging claim. The two
+        // per-task terms are the ones the recorded conjunction applies to the
+        // task itself, and both are load-bearing rather than defensive: a DUMMY
+        // task has no dispatchable shape to index a per-shape queue with, and a
+        // predicated task must reach the predicate test in push_ready_routed,
+        // which an early release returns before. The shell term keeps the flag
+        // off a root nothing can stage, which would otherwise pay a seq_cst CAS
+        // on every route for a claim it can never hold.
+        //
+        // Deciding it here rather than at staging time is what makes it safe:
+        // materialization owns this slot exclusively and runs strictly before
+        // any path can route the root, so the flag is never written beside a
+        // reader.
+        const bool root_stageable = shell_stages_roots &&
+                                    execution.fanin_offsets[i] == execution.fanin_offsets[i + 1] &&
+                                    !slot.task_attrs.has_predicate() && slot.task_kind != TaskKind::DUMMY;
+        if (root_stageable) slot.ed_flags |= ED_FLAG_CANDIDATE;
         slot.graph_context = &execution;
         payload.tensor_count = source.tensor_count;
         payload.scalar_count = source.scalar_count;
@@ -443,32 +497,40 @@ GraphMaterializeResult graph_execution_materialize_slice(
         simpler::hbg::Tensor *task_tensors = payload.tensor_data();
         for (int32_t j = 0; j < source.tensor_count; ++j) {
             const int32_t tensor_index = source.tensor_offset + j;
-            GraphTensor rebound;
-            if (!graph_rebind_tensor(
-                    execution, tasks, in_graph_task_offsets, definition_tensors[tensor_index],
-                    tensor_sources[tensor_index], i, &rebound
-                )) {
+            simpler::hbg::TensorData record{};
+            if (!graph_definition_load_element<simpler::hbg::TensorData>(
+                    image, object, definition.off_tensors, definition.tensor_arg_count, tensor_index, &record
+                ) ||
+                !graph_rebind_tensor(execution, record, &task_tensors[j])) {
                 execution.materialize_busy.store(0, std::memory_order_release);
                 return GraphMaterializeResult::INVALID;
             }
             execution.consumed_tensor_args++;
-            graph_tensor_unpack(rebound, &task_tensors[j]);
         }
         uint64_t *task_scalars = payload.scalar_data();
         for (int32_t j = 0; j < source.scalar_count; ++j) {
             const int32_t scalar_index = source.scalar_offset + j;
-            const GraphScalarSourceRef &ref = scalar_sources[scalar_index];
-            if (ref.source_kind == static_cast<uint8_t>(GraphScalarSourceKind::STATIC_VALUE)) {
-                task_scalars[j] = definition_scalars[scalar_index];
-            } else if (ref.source_kind == static_cast<uint8_t>(GraphScalarSourceKind::BOUNDARY)) {
-                if (ref.source_index >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr) {
+            GraphScalarInheritance ref{};
+            if (!graph_definition_load_element<GraphScalarInheritance>(
+                    image, object, definition.off_scalar_inheritance, definition.scalar_arg_count, scalar_index, &ref
+                )) {
+                execution.materialize_busy.store(0, std::memory_order_release);
+                return GraphMaterializeResult::INVALID;
+            }
+            if (!ref.inherited()) {
+                if (!graph_definition_load_element<uint64_t>(
+                        image, object, definition.off_scalars, definition.scalar_arg_count, scalar_index,
+                        &task_scalars[j]
+                    )) {
                     execution.materialize_busy.store(0, std::memory_order_release);
                     return GraphMaterializeResult::INVALID;
                 }
-                task_scalars[j] = execution.boundary_scalars[ref.source_index];
             } else {
-                execution.materialize_busy.store(0, std::memory_order_release);
-                return GraphMaterializeResult::INVALID;
+                if (ref.boundary_index() >= execution.boundary_scalar_count || execution.boundary_scalars == nullptr) {
+                    execution.materialize_busy.store(0, std::memory_order_release);
+                    return GraphMaterializeResult::INVALID;
+                }
+                task_scalars[j] = execution.boundary_scalars[ref.boundary_index()];
             }
         }
         reset_graph_payload(payload);
@@ -483,19 +545,23 @@ GraphMaterializeResult graph_execution_materialize_slice(
         // Resolved after the reset, which clears the predicate every task starts from.
         if (source.predicate_slot != 0) {
             const int32_t predicate_index = static_cast<int32_t>(source.predicate_slot) - 1;
-            GraphTensor operand;
-            // OWN_OUTPUT is a valid source for a tensor arg but never for an
-            // operand: it would bind the predicate to the buffer this task has
-            // yet to write, so the dispatch decision would read whatever the heap
-            // last held. The recorder refuses it; so does the image reader.
-            if (predicate_index >= definition.predicate_count ||
-                predicates[predicate_index].operand_source.source_kind ==
-                    static_cast<uint8_t>(GraphTensorSourceKind::OWN_OUTPUT) ||
-                !graph_rebind_tensor(
-                    execution, tasks, in_graph_task_offsets, predicates[predicate_index].operand,
-                    predicates[predicate_index].operand_source, i, &operand
-                ) ||
-                !graph_predicate_resolve(operand, predicates[predicate_index], &payload.predicate)) {
+            simpler::hbg::Tensor operand;
+            // The consuming task's own output is a valid source for a tensor arg but never
+            // for an operand: it would bind the predicate to the buffer this task has yet
+            // to write, so the dispatch decision would read whatever the heap last held.
+            // The recorder refuses it; so does the image reader, reading the same owner the
+            // rebind resolves against.
+            GraphPredicate predicate{};
+            const bool predicate_loaded =
+                predicate_index < definition.predicate_count &&
+                graph_definition_load_element<GraphPredicate>(
+                    image, object, definition.off_predicates, definition.predicate_count, predicate_index, &predicate
+                );
+            const TaskId operand_owner = predicate_loaded ? predicate.operand.owner_task_id : TaskId::invalid();
+            if (!predicate_loaded ||
+                (operand_owner.space() == TaskId::Space::SUB_TASK && operand_owner.local_id() == i) ||
+                !graph_rebind_tensor(execution, predicate.operand, &operand) ||
+                !graph_predicate_resolve(operand, predicate, &payload.predicate)) {
                 execution.materialize_busy.store(0, std::memory_order_release);
                 return GraphMaterializeResult::INVALID;
             }
@@ -518,7 +584,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
         return GraphMaterializeResult::INVALID;
     }
 
-    graph_execution_set_state(execution, GraphExecutionState::PREPARED);
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
     execution.materialize_busy.store(0, std::memory_order_release);
-    return GraphMaterializeResult::PREPARED;
+    return GraphMaterializeResult::MATERIALIZED;
 }

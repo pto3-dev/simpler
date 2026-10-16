@@ -29,7 +29,7 @@
 //
 // Host responsibilities:
 //   - allocate GM for handshake + result + the two SO bytes
-//   - resolve aic_ctrl_reg_base via halMemCtl(ADDR_MAP_TYPE_REG_AIC_CTRL)
+//   - resolve the AICPU-visible register base of each AICore
 //   - bundle DeviceArgs with the four addresses
 //   - register producer.o, launch on stream_aicore
 //   - bootstrap+register consumer.so, launch on stream_aicpu
@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "../shared/handshake.h"
+#include "../../cmake/aicore_reg_mapping.h"
 
 namespace fp {
 
@@ -215,27 +216,6 @@ struct DeviceContext {
     bool Valid() const { return device_id >= 0 && stream_aicore && stream_aicpu; }
 };
 
-// halMemCtl(ADDR_MAP_TYPE_REG_AIC_CTRL) returns the chip's AIC control-
-// register window base VA. The AICPU consumer derives each core's COND
-// MMIO from this base. Same call as src/{arch}/platform/onboard/host/host_regs.cpp.
-uint64_t QueryAicCtrlBase(int device_id) {
-    auto fn = (int (*)(int, void *, size_t, void *, size_t *))dlsym(nullptr, "halMemCtl");
-    if (fn == nullptr) {
-        std::fprintf(stderr, "halMemCtl not found in symbol table — link libascend_hal\n");
-        return 0;
-    }
-    AddrMapInPara in{};
-    in.devid = static_cast<unsigned int>(device_id);
-    in.addr_type = ADDR_MAP_TYPE_REG_AIC_CTRL;
-    AddrMapOutPara out{};
-    int rc = fn(0, &in, sizeof(in), &out, nullptr);
-    if (rc != 0) {
-        std::fprintf(stderr, "halMemCtl rc=%d\n", rc);
-        return 0;
-    }
-    return out.ptr;
-}
-
 constexpr size_t kDeviceArgsBytes = 160;
 constexpr size_t kBootstrapDispBin = 96;
 constexpr size_t kBootstrapDispLen = 104;
@@ -282,6 +262,18 @@ void PrintResultTable(const NotifPerfResult &r) {
     std::printf("  consumer_rc        = %d\n", r.consumer_rc);
     std::printf("  magic              = 0x%08x  %s\n", r.magic, r.magic == kNotifPerfResultMagic ? "OK" : "BAD");
     std::printf("  observed_p_seq     = %lu (must be > 0)\n", (unsigned long)r.observed_p_seq);
+    // Names which side ended the run. A producer that stopped on its own budget
+    // did not see the consumer's go transition, so the numbers above are a short
+    // measurement rather than a healthy one.
+    const char *prc = "OK, stopped by the consumer";
+    if (r.producer_rc == kNotifPerfProducerGoTimeout) {
+        prc = "go never reached the producer within its wait budget";
+    } else if (r.producer_rc == kNotifPerfProducerRunTimeout) {
+        prc = "producer hit its run budget; the consumer's stop never arrived";
+    } else if (r.producer_rc != kNotifPerfProducerOk) {
+        prc = "unrecognised";
+    }
+    std::printf("  producer_rc        = %u (%s)\n", r.producer_rc, prc);
 
     std::printf("\n  --- Phase 14: E2E AICore->AICPU latency ---\n");
     if (r.gm_samples > 0) {
@@ -292,7 +284,7 @@ void PrintResultTable(const NotifPerfResult &r) {
             ticks_to_ns(r.gm_min_ticks), (unsigned long)r.gm_max_ticks, ticks_to_ns(r.gm_max_ticks)
         );
     } else {
-        std::printf("  GM   no valid samples\n");
+        std::printf("  GM   no valid samples (%lu observed before their timestamp)\n", (unsigned long)r.gm_unordered);
     }
     if (r.cond_samples > 0) {
         uint64_t avg = r.cond_sum_ticks / r.cond_samples;
@@ -302,8 +294,16 @@ void PrintResultTable(const NotifPerfResult &r) {
             ticks_to_ns(r.cond_min_ticks), (unsigned long)r.cond_max_ticks, ticks_to_ns(r.cond_max_ticks)
         );
     } else {
-        std::printf("  COND no valid samples\n");
+        std::printf("  COND no valid samples (%lu observed before their timestamp)\n", (unsigned long)r.cond_unordered);
     }
+    // Separates "the register never moved" from "every sample was discarded":
+    // a zero unordered count next to zero samples means the wait timed out, and
+    // the core the consumer polled is then the first thing to check.
+    std::printf(
+        "  producer core_id   = 0x%x raw -> %u used%s  [%s]\n", r.core_id_raw, r.core_id_used,
+        (r.core_id_raw == r.core_id_used) ? "" : " (masked)",
+        r.core_id_from_producer ? "reported by producer" : "FALLBACK, producer never reported"
+    );
 
     std::printf("\n  --- Phase 13 supplemental: idle-state LDR rate (10000 LDRs) ---\n");
     std::printf(
@@ -359,23 +359,28 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint64_t aic_ctrl_base = QueryAicCtrlBase(device_id);
-    if (aic_ctrl_base == 0) {
-        std::fprintf(stderr, "halMemCtl(AIC_CTRL) returned 0\n");
-        return 1;
-    }
+    cann_examples::AicoreRegMapping reg_mapping;
+    if (!reg_mapping.Init(static_cast<uint32_t>(device_id))) return 1;
     std::printf(
-        "[notif-perf] aic_ctrl_base = 0x%016lx, target_core_idx = %u, n_samples = %u\n", aic_ctrl_base, target_core_idx,
-        n_samples
+        "[notif-perf] aic_cores = %u, register_slots = %zu, target_core_idx = %u, n_samples = %u\n",
+        reg_mapping.AicCoreCount(), reg_mapping.Bases().size(), target_core_idx, n_samples
     );
 
     // ---- Allocate GM ----
-    DevBuf dev_dispatcher, dev_consumer, dev_args, dev_result, dev_handshake;
+    DevBuf dev_dispatcher, dev_consumer, dev_args, dev_result, dev_handshake, dev_reg_bases;
     ACL_CHECK(dev_dispatcher.Alloc(dispatcher_bytes.size()), "dispatcher GM");
     ACL_CHECK(dev_consumer.Alloc(consumer_bytes.size()), "consumer GM");
     ACL_CHECK(dev_args.Alloc(kDeviceArgsBytes), "DeviceArgs GM");
     ACL_CHECK(dev_result.Alloc(sizeof(NotifPerfResult)), "Result GM");
     ACL_CHECK(dev_handshake.Alloc(sizeof(NotifPerfHandshake)), "Handshake GM");
+    const size_t reg_bases_bytes = reg_mapping.Bases().size() * sizeof(uint64_t);
+    ACL_CHECK(dev_reg_bases.Alloc(reg_bases_bytes), "register bases GM");
+    ACL_CHECK(
+        aclrtMemcpy(
+            dev_reg_bases.ptr, reg_bases_bytes, reg_mapping.Bases().data(), reg_bases_bytes, ACL_MEMCPY_HOST_TO_DEVICE
+        ),
+        "H2D register bases"
+    );
     ACL_CHECK(aclrtMemset(dev_result.ptr, sizeof(NotifPerfResult), 0, sizeof(NotifPerfResult)), "memset result");
     ACL_CHECK(
         aclrtMemset(dev_handshake.ptr, sizeof(NotifPerfHandshake), 0, sizeof(NotifPerfHandshake)), "memset handshake"
@@ -504,9 +509,11 @@ int main(int argc, char **argv) {
     run_args.result_addr = reinterpret_cast<uint64_t>(dev_result.ptr);
     run_args.input_token = ((uint64_t)getpid() << 32) ^ 0xC0DEC0DE5A5A5A5AULL;
     run_args.handshake_addr = reinterpret_cast<uint64_t>(dev_handshake.ptr);
-    run_args.aic_ctrl_reg_base = aic_ctrl_base;
+    run_args.reg_bases_addr = reinterpret_cast<uint64_t>(dev_reg_bases.ptr);
     run_args.target_core_idx = target_core_idx;
     run_args.n_samples = n_samples;
+    run_args.reg_core_count = static_cast<uint32_t>(reg_mapping.Bases().size());
+    run_args.cond_offset = reg_mapping.CondOffset();
     ACL_CHECK(
         aclrtMemcpy(dev_args.ptr, sizeof(run_args), &run_args, sizeof(run_args), ACL_MEMCPY_HOST_TO_DEVICE),
         "H2D DeviceArgs(run)"
@@ -561,6 +568,7 @@ int main(int argc, char **argv) {
     );
     PrintResultTable(result);
 
-    bool ok = (result.magic == kNotifPerfResultMagic) && (result.consumer_rc == 0) && (result.observed_p_seq > 0);
+    bool ok = (result.magic == kNotifPerfResultMagic) && (result.consumer_rc == 0) && (result.observed_p_seq > 0) &&
+              (result.producer_rc == kNotifPerfProducerOk);
     return ok ? 0 : 2;
 }

@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "graph_image_view.h"
 #include "scheduler_context.h"
 
 #include <cinttypes>
@@ -15,8 +16,10 @@
 
 #include "assert_compat.h"
 #include "common/unified_log.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
@@ -148,26 +151,26 @@ void format_core_status(
         return;
     }
     int32_t kernel = -1;
-    int64_t task_id_raw = -1;
+    TaskId task_id = TaskId::invalid();
     if (core_state && core_state->running_slot_state) {
         int32_t subslot = static_cast<int32_t>(core_state->running_subslot);
         kernel = core_state->running_slot_state->to_descriptor().kernel_id[subslot];
-        task_id_raw = static_cast<int64_t>(core_state->running_slot_state->to_descriptor().task_id.raw);
+        task_id = core_state->running_slot_state->to_descriptor().task_id;
     }
     uint64_t cond_reg = read_reg(reg_addr_for_cond, RegId::COND);
     int32_t hw_state = EXTRACT_TASK_STATE(cond_reg);
     const char *cond_reg_state_str = (hw_state == TASK_ACK_STATE) ? "ack" : "fin";
     if (hw_state == TASK_ACK_STATE) {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s)", core_id, kernel, task_id_raw,
-            cond_reg_state_str
+            buf, buf_size, "core%d(busy kernel=%d task=0x%" PRIx64 " cond_reg_state=%s)", core_id, kernel,
+            TaskId::to_uint64(task_id), cond_reg_state_str
         );
     } else {
         snprintf(
             buf, buf_size,
-            "core%d(busy kernel=%d task=%" PRId64
+            "core%d(busy kernel=%d task=0x%" PRIx64
             " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
-            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_id, kernel, TaskId::to_uint64(task_id), cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
             core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
@@ -204,8 +207,18 @@ bool SchedulerContext::no_thread_owns_running_task() const {
     return true;
 }
 
+// A stall dump's level follows its report, not its line: see StallDumpReport.
+#define STALL_DUMP_LOG(report, ...)                  \
+    do {                                             \
+        if ((report) == StallDumpReport::Shutdown) { \
+            LOG_WARN(__VA_ARGS__);                   \
+        } else {                                     \
+            LOG_INFO(__VA_ARGS__);                   \
+        }                                            \
+    } while (0)
+
 void SchedulerContext::log_stall_diagnostics(
-    int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count
+    int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count, StallDumpReport report
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
 
@@ -219,7 +232,7 @@ void SchedulerContext::log_stall_diagnostics(
         // below it was claimed by the host orchestrator, and no slot above it was.
         for (int32_t si = 0; si < task_count; si++) {
             ChipTaskSlotState &slot_state = tasks.get_slot_state_by_task_id(si);
-            ChipTaskState st = slot_state.task_state.load(std::memory_order_relaxed);
+            const bool completed = tasks.is_completed(si, std::memory_order_relaxed);
             // Polling: no fanin_refcount. Recompute met/total from the inline
             // fanin ids vs the task_states array (rc = satisfied producers,
             // fi = raw producer count) so the stall dump still shows readiness.
@@ -234,11 +247,11 @@ void SchedulerContext::log_stall_diagnostics(
             int32_t kid_aic = slot_state.to_descriptor().kernel_id[0];
             int32_t kid_aiv0 = slot_state.to_descriptor().kernel_id[1];
             int32_t kid_aiv1 = slot_state.to_descriptor().kernel_id[2];
-            int64_t task_id = static_cast<int64_t>(slot_state.to_descriptor().task_id.raw);
-            if (st >= CHIP_TASK_COMPLETED) continue;
-            // The slot mirror has no intermediate ready/running value — it
-            // stays PENDING until the worker stores COMPLETED (PUBLISHED
-            // lives in the task_states array, not here). Classify
+            uint64_t task_id = TaskId::to_uint64(slot_state.to_descriptor().task_id);
+            if (completed) continue;
+            // The state byte has no intermediate ready/running value — a task
+            // stays PENDING until it publishes PUBLISHED or COMPLETED, neither
+            // of which distinguishes queued from running. Classify
             // by the ground truth instead: a slot is RUNNING iff some
             // core has it as running_slot_state. A task occupies at most
             // 3 cores (one cluster), all under the same owner thread by
@@ -261,8 +274,9 @@ void SchedulerContext::log_stall_diagnostics(
             if (is_running) {
                 cnt_running++;
                 if (cnt_running > STALL_DUMP_READY_MAX) continue;
-                LOG_INFO(
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                STALL_DUMP_LOG(
+                    report,
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=RUNNING fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                     "running_on=[owner_thread=%d cores=[%s]]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
@@ -272,8 +286,9 @@ void SchedulerContext::log_stall_diagnostics(
             if (rc >= fi) {
                 cnt_ready++;
                 if (cnt_ready > STALL_DUMP_READY_MAX) continue;
-                LOG_INFO(
-                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+                STALL_DUMP_LOG(
+                    report,
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                     " state=READY   fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                     thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                 );
@@ -281,14 +296,16 @@ void SchedulerContext::log_stall_diagnostics(
             }
             cnt_waiting++;
             if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
-            LOG_INFO(
-                "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
+            STALL_DUMP_LOG(
+                report,
+                "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
                 " state=WAIT    fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                 thread_idx, idle_iterations, 0, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
             );
         }
         int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-        LOG_INFO(
+        STALL_DUMP_LOG(
+            report,
             "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
             "scan_ready=%d scan_waiting=%d scan_running=%d",
             thread_idx, idle_iterations, c, task_count, last_progress_count, cnt_ready, cnt_waiting, cnt_running
@@ -320,12 +337,42 @@ void SchedulerContext::log_stall_diagnostics(
             aiv1_buf, sizeof(aiv1_buf), aiv1_id, aiv1_idle, &core_exec_states_[aiv1_id],
             core_exec_states_[aiv1_id].reg_addr
         );
-        LOG_INFO(
-            "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
+        STALL_DUMP_LOG(
+            report, "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
             idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
         );
+        if (report == StallDumpReport::Shutdown) {
+            const int32_t core_ids[] = {aic_id, aiv0_id, aiv1_id};
+            for (int32_t core_id : core_ids) {
+                const CoreExecState &core = core_exec_states_[core_id];
+#if SIMPLER_DFX
+                const uint32_t physical_core_id = physical_core_ids_[core_id];
+#else
+                const uint32_t physical_core_id = core.physical_core_id;
+#endif
+                const int32_t tokens[] = {core.running_reg_task_id, core.pending_reg_task_id};
+                // These are AICPU publication records, not AICore readbacks or an
+                // atomic snapshot of other scheduler threads. Gated args belong
+                // to the AICore; their contents and src_payload are not dereferenced.
+                for (int slot = 0; slot < 2; ++slot) {
+                    if (tokens[slot] == AICPU_TASK_INVALID) continue;
+                    const uint32_t bank = static_cast<uint32_t>(tokens[slot]) & 1u;
+                    const DispatchPayload &payload = payload_per_core_[core_id][bank];
+                    LOG_WARN(
+                        "[STALL thread=%d] DISPATCH core=%d physical_core=%u slot=%s token=%d bank=%u "
+                        "payload=0x%" PRIx64 " args=0x%" PRIx64 " function_bin_addr=0x%" PRIx64
+                        " src_payload=0x%" PRIx64 " reg_addr=0x%" PRIx64,
+                        thread_idx, core_id, physical_core_id, slot == 0 ? "running" : "pending", tokens[slot], bank,
+                        reinterpret_cast<uint64_t>(&payload), reinterpret_cast<uint64_t>(payload.args),
+                        payload.function_bin_addr, payload.src_payload, core.reg_addr
+                    );
+                }
+            }
+        }
     }
 }
+
+#undef STALL_DUMP_LOG
 
 void SchedulerContext::log_shutdown_stall_snapshot(
     int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
@@ -344,7 +391,9 @@ void SchedulerContext::log_shutdown_stall_snapshot(
         thread_count = thread_count < 0 ? 0 : MAX_AICPU_THREADS;
     }
     for (int32_t t = 0; t < thread_count; t++) {
-        log_stall_diagnostics(t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count);
+        log_stall_diagnostics(
+            t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count, StallDumpReport::Shutdown
+        );
     }
 }
 
@@ -527,37 +576,108 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, int32_t cur
 #endif
 
 // =============================================================================
-// Shutdown: deinit AICore regs for this thread's cores (and PMU finalize if enabled).
-// Orchestrator threads have core_trackers_[thread_idx].core_num() == 0 -> no-op.
-// platform_deinit_aicore_regs is idempotent; safe to call after early completion.
+// Shutdown: each thread retires the cores it owns, on its own way out.
+// Core ownership is a partition — assign_cores_to_threads hands every cluster
+// to exactly one scheduler thread — so concurrent retirements never name the
+// same core. Emergency shutdown sweeps the whole table and claims per core, so
+// a core is retired exactly once no matter which path reaches it first.
 // =============================================================================
-int32_t SchedulerContext::shutdown(int32_t thread_idx) {
+int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
     const int32_t *cores = core_trackers_[thread_idx].core_ids();
-    int32_t core_num = core_trackers_[thread_idx].core_num();
-    if (core_num == 0) return 0;
+    const int32_t core_num = core_trackers_[thread_idx].core_num();
+    if (core_num == 0) return 0;  // threads that own no core
 
 #if SIMPLER_DFX
     if (is_pmu_enabled()) {
         pmu_aicpu_finalize(cores, core_num);
     }
 #endif
+    LOG_INFO("Thread %d: retiring %d cores", thread_idx, core_num);
+    return retire_cores(runtime, cores, core_num);
+}
 
-    LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
-    int32_t rc = 0;
-    for (int32_t i = 0; i < core_num; i++) {
-        int32_t core_id = cores[i];
-        uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
-        if (reg_addr != 0) {
-            // Timeout means AICore is unresponsive. Log and continue deiniting remaining cores.
-            if (platform_deinit_aicore_regs(reg_addr) != 0) {
-                LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, core_id);
-                rc = -1;
+int32_t SchedulerContext::retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
+    int32_t claimed_ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    for (int32_t i = 0; i < core_num; ++i) {
+        const int32_t core_id = core_ids[i];
+        if (core_id < 0 || core_id >= cores_total_num_) continue;
+        // An early request remains pending. Only the operation adding the
+        // second bit owns retirement; acquire observes the publisher's state.
+        if (__atomic_fetch_or(&retirement_state_[core_id], RETIREMENT_REQUESTED, __ATOMIC_ACQ_REL) ==
+            RETIREMENT_READY) {
+            claimed_ids[count++] = core_id;
+        }
+    }
+    return retire_claimed_cores(runtime, claimed_ids, count);
+}
+
+void SchedulerContext::publish_retirement_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
+    int32_t claimed_ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    for (int32_t i = 0; i < core_num; ++i) {
+        const int32_t core_id = core_ids[i];
+        // The initializer owns these metadata stores; requesters do not read
+        // them until READY. Unmapped cores stay unpublished for host recovery.
+        if (core_id < 0 || core_id >= cores_total_num_) continue;
+        if (core_exec_states_[core_id].reg_addr == 0) continue;
+        if (__atomic_fetch_or(&retirement_state_[core_id], RETIREMENT_READY, __ATOMIC_ACQ_REL) ==
+            RETIREMENT_REQUESTED) {
+            claimed_ids[count++] = core_id;
+        }
+    }
+    (void)retire_claimed_cores(runtime, claimed_ids, count);
+}
+
+void SchedulerContext::publish_all_retirement_cores(Runtime *runtime) {
+    // The serial initializer has joined every handshake before reading metadata.
+    int32_t ids[PLATFORM_MAX_CORES];
+    for (int32_t i = 0; i < cores_total_num_; ++i)
+        ids[i] = i;
+    publish_retirement_cores(runtime, ids, cores_total_num_);
+}
+
+int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
+    AicoreExitTarget targets[PLATFORM_MAX_CORES];
+    int32_t claimed_ids[PLATFORM_MAX_CORES];
+    size_t count = 0;
+    for (int32_t i = 0; i < core_num; ++i) {
+        const int32_t core_id = core_ids[i];
+        if (core_id < 0 || core_id >= cores_total_num_) continue;
+        const uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
+        if (reg_addr == 0) continue;
+        claimed_ids[count] = core_id;
+        targets[count] = {reg_addr, &runtime->get_teardown_gates()[core_id]};
+        ++count;
+    }
+    if (count == 0) return 0;
+
+    // platform_retire_aicore_group fills every entry on every path it returns
+    // from, so this needs no initializer.
+    bool released[PLATFORM_MAX_CORES];
+    const int32_t rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
+    if (rc != 0) {
+        // Naming the cores is the only signal an unreleased worker leaves: it
+        // spins on a gate it cannot log about, and the host sees just a stream
+        // timeout. See docs/troubleshooting/a2a3-worker-retirement.md.
+        for (size_t i = 0; i < count; ++i) {
+            if (!released[i]) {
+                LOG_ERROR(
+                    "AICore retirement: core %d not released (COND=0x%llx); worker stays blocked", claimed_ids[i],
+                    static_cast<unsigned long long>(read_reg(targets[i].reg_addr, RegId::COND))
+                );
             }
-        } else {
-            LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }
     }
     return rc;
+}
+
+int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
+    int32_t all[PLATFORM_MAX_CORES];
+    int32_t n = 0;
+    for (int32_t i = 0; i < cores_total_num_; ++i)
+        all[n++] = i;
+    return retire_cores(runtime, all, n);
 }
 
 // =============================================================================
@@ -573,7 +693,11 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
+    // native program launch, so only a report stamped with it is this run's;
+    // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
+    const uint64_t report_epoch = get_platform_run_result_epoch();
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
@@ -627,10 +751,15 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
         for (int32_t i = lo; i < hi; i++) {
             if (core_serviced[i]) continue;
             Handshake *hank = &all_handshakes[i];
-            if (hank->aicore_done == 0) {
+            if (!aicore_report_accepted(hank, report_epoch)) {
                 SPIN_WAIT_HINT();
                 continue;
             }
+            // The report's payload is Normal cacheable memory and nothing gives
+            // these loads an address or data dependency on the marker load, so
+            // without a load-load barrier they may be satisfied ahead of it.
+            // Once per accepted report, not per poll.
+            rmb();
             uint32_t physical_core_id = hank->physical_core_id;
             if (physical_core_id >= max_physical_cores_count) {
                 LOG_ERROR(
@@ -642,8 +771,16 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
                 remaining--;
                 continue;
             }
+            const uint64_t reg_addr = regs[physical_core_id];
+            if (reg_addr == 0) {
+                LOG_ERROR("Core %d reported physical_core_id=%u with no register window", i, physical_core_id);
+                handshake_failed_.store(true, std::memory_order_release);
+                core_serviced[i] = true;
+                remaining--;
+                continue;
+            }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
-            ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            ready[n_ready++] = {i, physical_core_id, reg_addr, hank->core_type};
             core_serviced[i] = true;
             remaining--;
         }
@@ -769,23 +906,13 @@ bool SchedulerContext::assign_cores_to_threads() {
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
-    (void)runtime;  // exit is now delivered via each core's register block, not GM
-    LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    int32_t timeout_count = 0;
-    for (int32_t i = 0; i < cores_total_num_; i++) {
-        // platform_deinit_aicore_regs writes DATA_MAIN_BASE=EXIT, which both
-        // releases a core still polling for its window to open and signals it to
-        // exit. Cores never opened (reg_addr==0) are reaped by the host device
-        // reset that follows a handshake failure.
-        if (core_exec_states_[i].reg_addr != 0) {
-            if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
-                timeout_count++;
-            }
-        }
-    }
-    if (timeout_count > 0) {
-        LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
-    }
+    // Sweeps every core rather than one thread's slice: a fatal run must not
+    // depend on the owning threads reaching their own shutdown. Per-core
+    // claiming keeps whatever they already retired untouched. A core still
+    // handshaking retains REQUESTED and its publisher services it after READY.
+    // Cores that never publish remain the host recovery path's responsibility.
+    LOG_WARN("Emergency shutdown: requesting retirement of all AICores");
+    (void)retire_all_cores(runtime);
 }
 
 // =============================================================================
@@ -796,6 +923,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
+    memset(retirement_state_, 0, sizeof(retirement_state_));
 
     // Wire thread configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -811,7 +939,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // hs_setup_done_, so it happens-before every thread's handshake_partition
     // and therefore before any register window is opened.
     if (is_chip_swimlane_enabled()) {
-        chip_swimlane_aicpu_init(runtime->worker_count);
+        chip_swimlane_aicpu_init(runtime->dev.worker_count);
         chip_swimlane_level_ = get_chip_swimlane_level();
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count
@@ -825,7 +953,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
             // records use the host callback path, so the device initializes no
             // dead AICPU orchestrator pool.
             const int orch_phase_threads = 0;
-            chip_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
+            chip_swimlane_aicpu_init_phase(runtime->dev.worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         chip_swimlane_level_ = ChipSwimlaneLevel::DISABLED;
@@ -833,11 +961,17 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
 #endif
 
     // Core count is needed by every thread to compute its handshake slice.
-    cores_total_num_ = runtime->worker_count;
+    cores_total_num_ = runtime->dev.worker_count;
     if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
     }
+    // The prior launch may have left RELEASE=1. The wmb() is what orders these
+    // resets before hs_setup_done_ and before any register window opens: a
+    // window is a plain Device-nGnRE store, carrying no release semantics of
+    // its own.
+    memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * cores_total_num_);
+    wmb();
     aic_count_ = 0;
     aiv_count_ = 0;
     handshake_failed_.store(false, std::memory_order_release);
@@ -848,6 +982,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
 
 int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     if (handshake_failed_.load(std::memory_order_acquire)) {
+        publish_all_retirement_cores(runtime);
         emergency_shutdown(runtime);
         return -1;
     }
@@ -875,6 +1010,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
 
     if (!assign_cores_to_threads()) {
+        publish_all_retirement_cores(runtime);
+        emergency_shutdown(runtime);
         return -1;
     }
 
@@ -945,13 +1082,18 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
             slab->error_code = SIMPLER_ERROR_NONE;
+            // Every core, not just the AIV pair the sub_block_id loop above walks:
+            // an AIC kernel bypasses L2 on the same terms as an AIV one.
+            dp.global_context.l2_cache_offset = get_dev_l2_cache_offset();
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }
     }
 
-    func_id_to_addr_ = runtime->func_id_to_addr_;
+    func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
+    func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
+    publish_all_retirement_cores(runtime);
     return 0;
 }
 
@@ -1008,6 +1150,7 @@ void SchedulerContext::deinit() {
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;
+    func_id_to_addr_count_ = 0;
 }
 
 void SchedulerContext::bind_runtime(RuntimeContext *rt) {
@@ -1076,7 +1219,7 @@ void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] in
 // exactly once. Graph tasks additionally enter the bounded preparation queue;
 // their external fanin follows the same ready/wake classification as any other
 // outer task.
-void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
+void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads, const GraphImageView &image) {
     if (completed_.load(std::memory_order_acquire) || sched_->task_view.tasks == nullptr) {
         return;
     }
@@ -1092,8 +1235,8 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         }
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
-            if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
-            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id.raw, thread_idx)) return;
+            if (graph_execution_localize(slot, image) == nullptr) slot.graph_context = nullptr;
+            if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id, thread_idx)) return;
         }
         int32_t state = sched_->classify_fanin_state(&slot);
         if (state < 0) {

@@ -17,12 +17,12 @@
  * running on real Ascend hardware with CANN compiler support.
  */
 
-#ifndef PLATFORM_A2A3_AICORE_INNER_KERNEL_H_
-#define PLATFORM_A2A3_AICORE_INNER_KERNEL_H_
+#pragma once
 
 #include <cstdint>
 
 #include "common/platform_config.h"
+#include "aicore_teardown.h"
 
 // AICore function attribute for CANN compiler
 #ifndef __aicore__
@@ -35,14 +35,28 @@
 // SPIN_WAIT_HINT - no-op on real hardware (AICore has dedicated polling support)
 #define SPIN_WAIT_HINT() ((void)0)
 
-// OUT_OF_ORDER_STORE_BARRIER - no-op on real hardware (dcci handles cache coherency)
-#define OUT_OF_ORDER_STORE_BARRIER() ((void)0)
+// A kernel's output dcci issues a write-back; it does not wait for one. The task
+// reports FIN right after, and a consumer that observes FIN then reads that
+// output, so the flush has to have completed first. pto-isa documents the pair
+// for this chip family (pto/npu/a2a3/grid_intrinsic.hpp) and the runtime already
+// pairs dsb with its own flushes when it publishes completion data
+// (runtime/async_kernel_api.h).
+#define OUT_OF_ORDER_STORE_BARRIER() dsb(DSB_DDR)
 
 // OUT_OF_ORDER_LOAD_BARRIER - no-op on real hardware (dcci handles cache coherency)
 #define OUT_OF_ORDER_LOAD_BARRIER() ((void)0)
 
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
+
+// EXITED acknowledges quiescence, not permission to return. The AICPU owns
+// this isolated line; bypass reads must not allocate a cached handshake copy.
+__aicore__ inline void wait_for_post_close_release(__gm__ uint32_t *release) {
+    while (static_cast<uint32_t>(ld_dev(release, 0)) != AICORE_POST_CLOSE_RELEASE) {
+        SPIN_WAIT_HINT();
+    }
+    dsb(DSB_DDR);
+}
 
 /**
  * Read an AICore register via SPR access
@@ -164,5 +178,3 @@ __aicore__ inline uint32_t get_physical_core_id() { return static_cast<uint32_t>
  * @return Hardware counter value (ticks)
  */
 __aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() { return get_sys_cnt(); }
-
-#endif  // PLATFORM_A2A3_AICORE_INNER_KERNEL_H_

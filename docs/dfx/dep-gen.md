@@ -162,10 +162,159 @@ The standard SceneTest path
 
 ---
 
+## 3.1 Background output (`collect_across_runs=True`)
+
+With `Worker(collect_across_runs=True)` on a level-3 worker, a
+`tensormap_and_ringbuffer` run keeps every step that touches the device on its
+own boundary — the receive drain and the terminal read — and hands the replay,
+the serialization and the file write to one background writer, so the host
+finishing run N can overlap run N+1's device execution. Device operators stay
+serial and diagnostic exclusivity is unchanged. Off by default.
+
+`host_build_graph` is covered too, by §3.2 — its graph is finished on the host
+inside `submit`, so what moves off the submit path there is the serialization and
+the write, not a device boundary.
+
+**`run()` returning no longer means `deps.json` exists.**
+`Worker.flush_diagnostics()` is the barrier that says the files up to that point
+are published, and `close()` publishes and joins. Both report a failed
+publication rather than reporting success over a missing file: the writer
+records a run's verdict before it makes that run's drained state observable, so
+a flush arriving between the two cannot see a settled collector with no error. Two runs may be unpublished at
+once, counting the one still collecting; a third is refused before anything is
+submitted, and the caller may flush first. Task ids are run-local, so two runs
+of the same callable repeat them — a graph is identified by the directory it is
+published under, never by its task ids.
+
+Publication is atomic: the graph is written to `deps.json.tmp` opened
+`O_CREAT|O_EXCL` and published with `link`, which never replaces an existing
+name. A destination already holding a `deps.json` therefore fails the run with
+that file untouched, and a partly written graph is never visible under the real
+name.
+
+### 3.2 Background output for the host-built graph
+
+`host_build_graph` builds the whole graph on the host, during `submit`, and the
+default path serializes and writes `deps.json` right there — before the run is
+even launched. With `collect_across_runs=True` on a level-3 worker the finished
+graph is instead **moved** out of the capturing thread's storage into an export
+the runner owns, and a background writer publishes it. The hand-off still happens
+on the thread that built the graph: capture lives in thread-local state, so that
+is the only thread that can hand it over (`test_dep_gen_thread_affinity.py`
+exists because an emit moved to drain produced no file at all).
+
+What authorizes publication is therefore **a completed host orchestration**, not
+a successful run: the device contributes nothing to this graph, and there is no
+device record to reconcile or terminal state to read. So a `deps.json` can exist
+for a run that later fails on the device, that was never launched because a
+later step of `prepare` failed, or whose device completion is unknown. That is
+what the default path already does, and it is deliberately **not** the
+`tensormap_and_ringbuffer` rule above, whose quarantine exists because its
+records live on the device.
+
+Three states are told apart, where the default path has one error code for all
+of them:
+
+| At hand-off | Result |
+| ----------- | ------ |
+| the orchestration ran on this thread and closed every task | published — an orchestration that submitted **no** tasks publishes a well-formed empty graph |
+| capture was never armed, or the orchestration ran on another thread | no file, and the flush reports it |
+| a task was opened and never closed | no file, and the flush reports it |
+
+**Retention bounds what is kept, not what may run.** At most two unpublished
+graphs, against the same 256 MiB per-exporter budget, charged from the actual
+capacity of the five vectors an export holds plus a 1 MiB serialization
+reservation and a fixed destination per slot. When both slots are taken, or a
+graph is larger than the budget can accept, **the calling thread publishes it
+immediately** rather than failing the run — that submit waits for the write, as
+it did before this existed, and nothing is dropped. A legitimately large graph
+can exceed the budget and take that route.
+
+The budget covers what is retained after the hand-off and nothing else: the
+capture's own peak during `submit`, an inline write's file buffering, thread
+stacks, allocator metadata and the file on disk are all outside it.
+
+Both routes publish the same way — an exclusive `deps.json.tmp`, the stream
+flushed and closed with its state checked afterwards, then `link`, which never
+replaces a name. So an occupied destination fails that run's diagnostic with the
+existing file untouched, and a partly written graph is never visible under the
+real name. A temporary left behind by something else makes the publication refuse
+rather than be deleted. The output directory plus the file name must fit 4096
+bytes; a longer one is refused by name.
+
+`flush_diagnostics()` waits for every publication already under way and reports
+sticky failures; `close()` closes admission, drains, and joins the writer. A
+flush does not wait for a `submit` racing it that has not yet declared a write —
+such a call finishes after the flush's linearization point, like any later
+submit. No bounded-`close()` promise on a slow disk.
+
+First step is local level 3 on a2a3/a5 (onboard and sim). Level 2 — which is
+what `tests/st/{a2a3,a5}/host_build_graph/dfx/dep_gen/test_dep_gen.py` uses —
+keeps the synchronous path, and so does every run with the option off.
+
+### One whole graph, or no file
+
+`deps.json` has no metadata line and no completeness field, so there is nowhere
+to mark a partial graph. Either the whole graph is published, or no new file is
+produced for that run and an error is reported — and any file already at the
+destination is left as it was, which is not the same as this run having produced
+a graph. The refusals are: a device drop, a buffer the device still held, a
+broken count identity, a device counter at its saturation sentinel, a failed
+device read, an unresolvable in-flight buffer, a host-side record clamp, a
+record stamped with a run this collector never admitted, a counter reset that
+did not reach the device, a record whose ring or local id is out of domain, a
+refused memory charge, and a failed replay or write. In background mode these
+are sticky for the runner's life and reported by `flush_diagnostics()` and
+`close()`; a run whose device completion is unproved reads nothing shared and
+publishes nothing.
+
+### Memory
+
+Each collector has its own 256 MiB host budget for retained records and output
+work — not shared with other collectors, and not a whole-Worker limit. It covers
+the record blocks, the two export slots and their bounded path storage, a 1 MiB
+serialization reservation, alignment, and the replay's actual working storage:
+the contiguous record layout the replay indexes, the two host tensormaps (about
+17.1 MiB of floor per replay), and the task, tensor and edge tables. One tensor
+can name several producers, so edges and indexes are charged as they actually
+grow, including a reallocation's old and new blocks at once. Record blocks are
+charged before they are allocated and credited only after they are freed. The
+writer asks for a publication's working storage only once it has taken that
+export, so there is one working set at a time however many exports are sealed.
+Over-budget, out-of-domain and arithmetic-overflow conditions all refuse the
+graph rather than allocating, and no wait is introduced for storage a future
+credit might supply.
+
+Outside that budget, and separately bounded: the fixed device buffer pool
+(about 18.5 MiB), its host shadow on non-SVM platforms, and the fixed control
+region — one of each per collector per device context. Thread stacks, allocator
+metadata and system file buffers are not accounted in the application budget,
+and the output file is disk rather than host memory.
+
+### Device counters
+
+The three device counters saturate at `UINT32_MAX` instead of wrapping, and a
+counter reading it means the run passed the countable limit: its counts are
+unknown and no graph is published. This costs a compare at each increment on
+every dep_gen-enabled run, and it changes bytes in the shared AICPU image that
+`host_build_graph` also links.
+
+### With background output off
+
+The default path is unchanged in filename, location, schema and the bytes a
+clean run produces, and it still writes at the original boundary. What changed
+is that the refusals listed above now withhold the file there too, reported on
+that path's existing log channel — no sticky error is added, the run's return
+code does not change, and no 256 MiB limit applies. The host-built graph's
+default path is unchanged in the same way, including its overwrite behaviour;
+what it gained is the write-error check the stream only reports at flush and
+close, which was previously read one step too early.
+
 ## 4. Output: `deps.json`
 
 ```json
 {
+  "runtime": "tensormap_and_ringbuffer",
   "tasks": [
     {"task_id": "0",          "scope": "auto", "kernel_ids": [-1,-1,-1], "block_num": 1, "args": []},
     {"task_id": "4294967296", "scope": "auto", "kernel_ids": [7,-1,-1], "block_num": 4, "args": [
@@ -206,16 +355,29 @@ silently lose precision if encoded as numbers. Python consumers pass
 these through `int(v)` which accepts either form, so the schema is
 JS-safe without burdening Python.
 
-Task ids are `TaskId::raw`. The low 32 bits are a local id; the high 32 bits
+Task ids are the handle's encoded word, as `TaskId::to_uint64` yields it. The low
+32 bits are a local id; the bits above it
 mean whatever the runtime that minted the record says they mean — a ring index
-(`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`) or an id space
-(`host_build_graph`, `0 = GLOBAL`, `1 = IN_GRAPH`). See
+in bits 39:32 (`tensormap_and_ringbuffer`, `0..CHIP_MAX_RING_DEPTH-1`), or an id
+space in bits 63:62 plus a parent task in bits 51:32 (`host_build_graph`,
+`0 = GLOBAL`, `1 = SUB_TASK`, `2 = PARAM`). See
 `src/common/{tensormap_and_ringbuffer,host_build_graph}/task_id.h`.
-Which one a record carries is a property of its runtime, not of the value:
+
+Which one a record carries is a property of its runtime, not of the value, so
+the top-level **`runtime`** key names it. Decode against that key rather than
+guessing from the number — `deps_viewer` does, which is what makes a sub-task
+render as `g{parent}t{index}` instead of a ten-digit high field:
 
 ```python
-high = (raw >> 32) & 0xFF
+runtime = data["runtime"]  # required; a capture without it is refused, not guessed
 local = raw & 0xFFFFFFFF
+if runtime == "host_build_graph":
+    space = (raw >> 62) & 0x3           # 0 GLOBAL, 1 SUB_TASK, 2 PARAM
+    parent = (raw >> 32) & 0xFFFFF      # meaningful for SUB_TASK only
+elif runtime == "tensormap_and_ringbuffer":
+    ring = (raw >> 32) & 0xFF
+else:
+    raise ValueError(f"unsupported runtime: {runtime!r}")
 ```
 
 ### `tasks[]`
@@ -243,7 +405,7 @@ Each edge is `{pred, succ}` plus annotation. Fields:
 
 | Field | Type | When present | Meaning |
 | ----- | ---- | ------------ | ------- |
-| `pred`, `succ` | uint64 (string) | always | `TaskId::raw` of producer and consumer |
+| `pred`, `succ` | uint64 (string) | always | Producer's and consumer's encoded task id (`TaskId::to_uint64`) |
 | `arg` | int32 | always | Consumer's arg-slot index; `-1` for `explicit` source |
 | `source` | string | always | `explicit` (from `explicit_deps[]`), `creator` (`owner_task_id` retention), or `tensormap` (overlap lookup hit) |
 | `flags` | string array | `tensormap_and_ringbuffer` | Subset of `["wait", "retain"]` — the edge's `DepFlags`. `wait` = ordering (readiness); `retain` = producer lifetime held until the consumer releases. `creator` edges are `["wait","retain"]`; `tensormap` edges `["wait"]`. `explicit` edges start with the per-dependency kind captured at submit time, so `CoreTaskArgsWithDeps::add_dep_wait()` emits `["wait"]` while the default dependency kind emits `["wait","retain"]`. When the same producer is also the creator of an input, replay matches runtime fanin dedup by OR-accumulating the creator's flags into the explicit edge. `DepFlags` is a `tensormap_and_ringbuffer` runtime concept — it does not exist in the host_build_graph tree — so the host-orchestrated writer omits the field rather than lagging behind it. Consumers must treat it as optional. |
@@ -431,8 +593,8 @@ list; only the dep_gen replay graph loses the tail.
 | AICPU writer | `src/{a2a3,a5}/platform/include/aicpu/dep_gen_collector_aicpu.h`, `src/common/platform/shared/aicpu/dep_gen_collector_aicpu.cpp` | Single-instance write path; weak-fallback exported to host build. Both platforms share the same writer implementation — the writer accesses its own device-side view of shared memory, independent of how host↔device transport is implemented. |
 | Host collector | `src/common/platform/include/host/dep_gen_collector.h`, `src/common/platform/shared/host/dep_gen_collector.cpp` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector. On non-SVM platforms it uses the base `alloc_paired_buffer`, which malloc's a host shadow + `copy_to_device`'s it and registers it via `add_malloc_shadow` so teardown can free it; `reconcile_counters` explicitly `copy_from_device`'s the BufferState before reading, and `finalize` lets `BufferPoolManager::clear_mappings()` release all shadows as the single source of truth. |
 | Capture call site (device-orch) | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. The schema carries `kernel_ids[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. It also carries the SPMD logical block num (`block_num` on a2a3, `core_num` on a5's launch spec) as `tasks[].block_num`. |
-| Replay | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `ChipTensorMap` instances. Emits `deps.json` when both passes agree per record. Platform-agnostic — a5 reuses the a2a3 source verbatim. |
-| Host-direct capture (host-orch) | `src/common/host_build_graph/dep_gen_host_graph.h`, `src/common/host_build_graph/host/dep_gen_host_graph.cpp` | Task / tensor / edge tables filled from `submit_task_common` + `compute_task_fanin`'s `Annotate` hooks (`src/common/host_build_graph/dep_compute.h`), reset per orchestration by `run_host_orchestration`, serialized by the same `deps.json` writer. The runtime translation unit carries weak no-op fallbacks so the AICPU build links without it. |
+| Replay | `src/common/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `ChipTensorMap` instances. Emits `deps.json` when both passes agree per record. One source for both platforms: it includes `dep_compute.h`, `tensormap.h` and `tensor.h` by bare name, so each architecture's host target compiles it against its own runtime headers. |
+| Host-direct capture (host-orch) | `src/common/host_build_graph/host/dep_gen_host_graph.h`, `src/common/host_build_graph/host/dep_gen_host_graph.cpp` | Task / tensor / edge tables filled from `submit_task_common` + `compute_task_fanin`'s `Annotate` hooks (`src/common/host_build_graph/host/dep_compute.h`), reset per orchestration by `run_host_orchestration`, serialized by the same `deps.json` writer. The runtime translation unit carries weak no-op fallbacks so the AICPU build links without it. |
 | Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | `dep_gen_host_graph_active()` picks the shape: host-orch calls `dep_gen_host_graph_emit(deps_path)` at teardown — reading the thread-local graph its own orchestration built on the same child progress thread — and skips collector init/start/reconcile entirely; device-orch calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` post-`reconcile_counters`. The c_api latches the CallConfig before the bind so host capture is armed before the orchestration it records. |
 | Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |
 | Test | `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py` + `test_dep_gen_chain.py`, `tests/st/{a2a3,a5}/host_build_graph/dfx/dep_gen/test_dep_gen.py` | Smoke test + edge validation against a `vector_example`-shaped orchestration. Each `host_build_graph` case runs an orchestration through host-direct capture and asserts its declared edges, so a divergence between the two shapes fails a test. The orchestrations are not shared across the two cases — a2a3's dep_gen test carries its own 5-task / 6-edge copy, a5's reuses the 4-task / 4-edge `vector_example` scene test's — so each asserts its own graph. |

@@ -31,7 +31,7 @@
  *
  * Type aliases:
  *   CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>       — leaf kernel binary
- *   ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024> — orchestration + child kernels
+ *   ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_CHILDREN> — orchestration + child kernels
  */
 
 #pragma once
@@ -40,9 +40,20 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "arg_direction.h"
+#include "callable_limits.h"
+
+// signature contains sig_count validated entries.
+inline int32_t count_scalar_args(const ArgDirection *signature, int32_t sig_count) {
+    int32_t scalar_count = 0;
+    for (int32_t i = 0; i < sig_count; ++i) {
+        if (signature[i] == ArgDirection::SCALAR) ++scalar_count;
+    }
+    return scalar_count;
+}
 
 // ============================================================================
 // Forward declaration
@@ -98,6 +109,8 @@ static constexpr int CALLABLE_FUNC_NAME_MAX = 64;
 
 template <typename Child, int MaxSig, int MaxChildren>
 struct Callable {
+    static constexpr int MAX_CHILDREN = MaxChildren;
+
     ArgDirection signature_[MaxSig];
     int32_t sig_count_;
     uint32_t binary_size_;
@@ -129,6 +142,15 @@ struct Callable {
     uint32_t func_name_len() const { return func_name_len_; }
     const char *config_name() const { return config_name_; }
     uint32_t config_name_len() const { return config_name_len_; }
+    int32_t scalar_count() const {
+        if (sig_count_ < 0 || sig_count_ > MaxSig) {
+            throw std::invalid_argument(
+                "Callable: signature count " + std::to_string(sig_count_) + " is outside the supported range [0, " +
+                std::to_string(MaxSig) + "]"
+            );
+        }
+        return count_scalar_args(signature_, sig_count_);
+    }
 
     const Child &child(int32_t i) const {
         if (i < 0 || i >= child_count_) throw std::out_of_range("Callable: child index out of range");
@@ -160,7 +182,7 @@ private:
 // ============================================================================
 
 using CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>;
-using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>;
+using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_CHILDREN>;
 
 // storage_ holds CoreCallable children at CALLABLE_ALIGN-aligned offsets; the
 // child kernel binary's device address is offsetof(storage_) + child_offset +
@@ -176,6 +198,39 @@ static_assert(
     offsetof(ChipCallable, storage_) % CALLABLE_CHILD_ALIGN == 0,
     "ChipCallable.storage_ must be CALLABLE_CHILD_ALIGN-aligned for SIMT kernel binaries"
 );
+
+// Callable bytes are shipped through L3/L4 IPC and the on-disk kernel cache,
+// so the header layout is wire ABI. These explicit size and offset assertions
+// pin the layout independently of the capacity constants.
+static_assert(
+    std::is_trivially_copyable_v<ChipCallable> && std::is_standard_layout_v<ChipCallable>,
+    "ChipCallable wire ABI: must stay memcpy-able POD"
+);
+static_assert(
+    std::is_trivially_copyable_v<CoreCallable> && std::is_standard_layout_v<CoreCallable>,
+    "CoreCallable wire ABI: must stay memcpy-able POD"
+);
+static_assert(offsetof(ChipCallable, signature_) == 0, "ChipCallable wire ABI: signature offset changed");
+static_assert(offsetof(ChipCallable, sig_count_) == 1024, "ChipCallable wire ABI: sig_count offset changed");
+static_assert(offsetof(ChipCallable, binary_size_) == 1028, "ChipCallable wire ABI: binary_size offset changed");
+static_assert(offsetof(ChipCallable, func_name_) == 1032, "ChipCallable wire ABI: func_name offset changed");
+static_assert(offsetof(ChipCallable, func_name_len_) == 1096, "ChipCallable wire ABI: func_name_len offset changed");
+static_assert(offsetof(ChipCallable, child_func_ids_) == 1100, "ChipCallable wire ABI: child_func_ids offset changed");
+static_assert(offsetof(ChipCallable, child_offsets_) == 9292, "ChipCallable wire ABI: child_offsets offset changed");
+static_assert(offsetof(ChipCallable, child_count_) == 17484, "ChipCallable wire ABI: child_count offset changed");
+static_assert(offsetof(ChipCallable, config_name_) == 17488, "ChipCallable wire ABI: config_name offset changed");
+static_assert(
+    offsetof(ChipCallable, config_name_len_) == 17552, "ChipCallable wire ABI: config_name_len offset changed"
+);
+static_assert(offsetof(ChipCallable, storage_) == 17568, "ChipCallable wire ABI: storage offset changed");
+static_assert(sizeof(ChipCallable) == 17568, "ChipCallable wire ABI: header size changed");
+static_assert(offsetof(CoreCallable, signature_) == 0, "CoreCallable wire ABI: signature offset changed");
+static_assert(offsetof(CoreCallable, sig_count_) == 128, "CoreCallable wire ABI: sig_count offset changed");
+static_assert(offsetof(CoreCallable, binary_size_) == 132, "CoreCallable wire ABI: binary_size offset changed");
+static_assert(offsetof(CoreCallable, resolved_addr_) == 136, "CoreCallable wire ABI: resolved_addr offset changed");
+static_assert(offsetof(CoreCallable, storage_) == 144, "CoreCallable wire ABI: storage offset changed");
+static_assert(sizeof(CoreCallable) == 144, "CoreCallable wire ABI: header size changed");
+static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
 
 // ============================================================================
 // Factory: make_callable for static leaf
@@ -286,4 +341,14 @@ std::vector<uint8_t> make_callable(
     obj->child_count_ = child_count;
 
     return buf;
+}
+
+inline std::vector<uint8_t> make_chip_callable(
+    const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
+    const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count,
+    const char *config_name
+) {
+    return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, ChipCallable::MAX_CHILDREN>(
+        sig, sig_count, func_name, binary, binary_size, child_func_ids, child_buffers, child_count, config_name
+    );
 }

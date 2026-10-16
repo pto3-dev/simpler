@@ -17,8 +17,8 @@
  * translation units need only the kinds:
  *
  *   - the host trace and record store, which format and file the records;
- *   - host_build_graph/host/orchestrator.cpp, which raises the kinds but needs
- *     none of the record machinery;
+ *   - the host_build_graph orchestrator's submit translation units, which raise the
+ *     kinds but need none of the record machinery;
  *   - orchestration_api.h, compiled into the orchestration .so, where the
  *     platform's host headers are absent.
  *
@@ -49,22 +49,23 @@ enum class HostPhaseKind : uint32_t {
     BindSharedMem,
     BindRuntimeInit,
     BindHostOrch,
-    BindGraphUpload,
+    BindGraphPack,
     BindArenaH2d,
     BindHostViewClose,
-    // Recorded by the host orchestrator (host_build_graph/host/orchestrator.cpp).
-    OrchSubmitTask,         // submit_task_common: one ordinary task
-    OrchAllocTensors,       // prepare_task: one alloc_tensors slot
-    OrchRecordInGraphTask,  // graph_record_submit_in_graph_task: one recorded in-graph task
-    OrchGraphSubmit,        // graph_submit_definition: one outer GRAPH task
-    OrchBuildDefinition,    // graph_layout_definition + graph_fill_definition: one image
-    OrchGraphBegin,         // graph_begin: the whole entry, OrchGraphSubmit nested inside
-    OrchRecordingWait,      // graph_commit's wait for the last recorder to finish
-    OrchGraphCommit,        // graph_commit: the wait plus back-patching every shell
+    // Recorded by the host orchestrator: the ordinary path in
+    // host_build_graph/host/orchestrator.cpp, the Graph path in host/graph_submit.cpp.
+    OrchSubmitTask,       // submit_task_common: one ordinary task
+    OrchAllocTensors,     // prepare_task: one alloc_tensors slot
+    OrchRecordSubTask,    // graph_record_submit_sub_task: one recorded sub-task
+    OrchGraphSubmit,      // graph_submit_definition: one outer GRAPH task
+    OrchBuildDefinition,  // graph_layout_definition + graph_fill_definition: one image
+    OrchGraphBegin,       // graph_begin: the whole entry, OrchGraphSubmit nested inside
+    OrchRecordingWait,    // graph_commit's wait for the last recorder to finish
+    OrchGraphCommit,      // graph_commit: the wait plus back-patching every shell
     // Recorded in the orchestration .so (orchestration_api.h), which measures the
     // three submission segments the runtime cannot see.
     OrchSubmitAdmit,    // rt_submit_graph: entry until the Graph is admitted
-    OrchRecordHandoff,  // rt_graph_begin's return until the recorder's first in-graph task
+    OrchRecordHandoff,  // rt_graph_begin's return until the recorder's first sub-task
     OrchGeneratedArgs,  // between two submissions: the generated code's own arg setup
     Count
 };

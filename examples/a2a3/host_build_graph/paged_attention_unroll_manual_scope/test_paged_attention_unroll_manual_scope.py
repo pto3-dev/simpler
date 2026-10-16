@@ -11,6 +11,7 @@
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
@@ -26,7 +27,7 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/paged_attention_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
+            "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT, D.IN],
         },
         "incores": [
             {
@@ -107,16 +108,43 @@ class TestPagedAttentionUnrollManualScopeHostBuildGraph(SceneTestCase):
         },
     ]
 
+    # Matched A/B for the child_memory declaration: same workload, same fixtures,
+    # only the memory policy differs.
+    CASES += [
+        {
+            "name": name,
+            "platforms": ["a2a3"],
+            "manual": True,
+            "params": {
+                "batch": 16,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 1024,
+                "max_model_len": 2048,
+                "dtype": "bfloat16",
+                "child_memory": child_memory,
+            },
+        }
+        for name, child_memory in (("HostStaged", False), ("ChildMemory", True))
+    ]
+
     def generate_args(self, params):
         params = {**params, "variant": "paged_attention_unroll"}
         result = _pa_generate_inputs(params)
+        child_memory = params.get("child_memory", False)
         specs = []
         for name, value in result:
             if isinstance(value, torch.Tensor):
-                specs.append(TensorArg(name, value))
+                specs.append(TensorArg(name, value, child_memory=child_memory))
             else:
                 specs.append(Scalar(name, value))
-        return TaskArgsBuilder(*specs)
+        tensors = [s for s in specs if isinstance(s, TensorArg)]
+        scalars = [s for s in specs if isinstance(s, Scalar)]
+        by_name = {s.name: s.value for s in tensors}
+        tensors.append(TensorArg("host_context_lens", by_name["context_lens"].clone(), transfer=TensorTransfer.NONE))
+        return TaskArgsBuilder(*tensors, *scalars)
 
     def compute_golden(self, args, params):
         tensors = {s.name: s.value for s in args.specs if isinstance(s, TensorArg)}

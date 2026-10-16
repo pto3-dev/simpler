@@ -25,6 +25,10 @@ device, regardless of die count.
 | AIC | 18 | 36 |
 | AIV | 36 | 72 |
 
+Each 1-AIC + 2-AIV cluster shares a 3 KiB SSBUF, represented by
+`PLATFORM_SSBUF_SIZE`. Runtime reservations constrain kernel use; see the
+[host_build_graph SSBUF contract](runtimes.md#host_build_graph).
+
 L1 / L0A / L0B / L0C (per AIC), UB (per AIV), and L2 (per AICore
 cluster) exist per the cross-chip model — sizes are not documented in
 this repo.
@@ -271,8 +275,9 @@ that exact value. `PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14`
 remains a compile-time **upper bound** (array sizes, headroom), not the
 actual launch count. See:
 
-- `src/a5/platform/onboard/host/aicpu_topology_probe.{h,cpp}` — probe +
-  cluster-first packing
+- `src/a5/platform/onboard/host/aicpu_topology_probe.cpp` — driver queries
+- `src/a5/platform/onboard/host/aicpu_affinity_select.cpp` — topology assembly,
+  fallback and cluster-first packing (`compute_allowed_cpus`)
 - `src/a5/platform/onboard/host/device_runner.cpp` — fills
   `aicpu_allowed_cpus[]` + `aicpu_launch_count` in Runtime, launches
   with that count

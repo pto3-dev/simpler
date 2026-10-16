@@ -11,8 +11,8 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
-// Cluster-local dependency scheduling uses one device-side protocol.
-#include "scheduler/scheduler_dispatch.h"
+// AICore dependency scheduling uses one device-side protocol.
+#include "scheduler/scheduler_mix.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
@@ -27,10 +27,8 @@ __aicore__ void legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
 namespace {
 
 constexpr uint32_t kInitialBackoffIterations = 8;
-constexpr uint32_t kMaximumBackoffIterations = 128;
+constexpr uint32_t kMaximumBackoffIterations = 32;
 constexpr uint32_t kSchedulerErrorPollInterval = 64;
-
-static_assert(SCHEDULER_CALLABLE_CAPACITY == RUNTIME_MAX_FUNC_ID, "AICore ready scheduler layout mismatch");
 
 struct SchedulerWorkerStats {
     uint64_t bootstrap_task_count{0};
@@ -46,11 +44,9 @@ struct SchedulerWorkerStats {
     uint64_t completion_enqueue_cycles{0};
     uint64_t bootstrap_start_cycles{0};
     uint64_t bootstrap_scan_end_cycles{0};
-    uint64_t bootstrap_end_cycles{0};
     uint64_t target_bootstrap_start_cycles{0};
     uint64_t target_bootstrap_end_cycles{0};
     uint64_t bootstrap_target_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-    uint64_t bootstrap_ready_claim_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
     uint64_t bootstrap_slot_fill_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
     uint64_t drain_start_cycles{0};
     uint64_t drain_end_cycles{0};
@@ -61,64 +57,11 @@ struct SchedulerWorkerStats {
     uint64_t exit_ack_publish_cycles{0};
 };
 
-struct SchedulerInterTaskTiming {
-    uint64_t completion_service_cycles{0};
-    uint64_t dispatch_cycles[SCHEDULER_CORE_TYPE_COUNT]{};
-    SchedulerCompletionServiceTiming completion{};
-    uint64_t gang_service_cycles{0};
-    SchedulerNormalDispatchTiming dispatch{};
-    uint64_t ready_poll_cycles{0};
-    uint64_t backoff_cycles{0};
-
-    __aicore__ void reset() { *this = {}; }
-};
-
-__aicore__ __attribute__((always_inline)) void publish_scheduler_tail_trace(
-    __gm__ SchedulerWorkerContext *context, uint64_t start_cycles, uint64_t end_cycles,
-    const SchedulerInterTaskTiming &timing
-) {
-    __gm__ SchedulerTailTrace *trace = &context->scheduler_tail_trace;
-    trace->start_cycles = start_cycles;
-    trace->end_cycles = end_cycles;
-    trace->completion_scan_cycles = timing.completion.scan_cycles;
-    trace->completion_consume_cycles = timing.completion.consume_cycles;
-    trace->completion_resolve_cycles = timing.completion.resolve_cycles;
-    trace->completion_ready_publish_cycles = timing.completion.ready_publish_cycles;
-    trace->completion_refill_cycles = timing.completion.refill_cycles;
-    trace->completion_finalize_cycles = timing.completion.finalize_cycles;
-    trace->gang_service_cycles = timing.gang_service_cycles;
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
-        trace->dispatch_probe_cycles[type] = timing.dispatch.probe_cycles[type];
-        trace->dispatch_claim_cycles[type] = timing.dispatch.claim_cycles[type];
-        trace->dispatch_prepare_cycles[type] = timing.dispatch.prepare_cycles[type];
-        trace->dispatch_materialize_cycles[type] = timing.dispatch.materialize_cycles[type];
-        trace->dispatch_publish_cycles[type] = timing.dispatch.publish_cycles[type];
-    }
-    trace->ready_poll_cycles = timing.ready_poll_cycles;
-    trace->backoff_cycles = timing.backoff_cycles;
-    scheduler_publish_cache_line(&trace->start_cycles);
-    scheduler_publish_cache_line(&trace->dispatch_materialize_cycles[0]);
-    scheduler_gm_publish(trace->valid, UINT64_C(1));
-}
-
-struct SchedulerExecutionRecord {
-    int64_t task_id{SCHEDULER_TASK_ID_INVALID};
-    uint64_t claim_worker_id{0};
-    uint64_t claim_start_cycles{0};
-    uint64_t claim_end_cycles{0};
-    SchedulerReadySource ready_source{SchedulerReadySource::LOCAL};
-};
-
 __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPayload *payload) {
     if (payload == nullptr || payload->function_bin_addr == 0) return;
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
-}
-
-__aicore__ __attribute__((always_inline)) bool
-should_commit_scheduler_trace(__gm__ void *, __gm__ SchedulerWorkerContext *, __gm__ SchedulerDispatchSlot *slot) {
-    return slot->gang == 0;
 }
 
 __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations) {
@@ -148,15 +91,12 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
     context->wake_close_count = stats.wake.wake_close_count;
     context->completion_enqueue_count = stats.completion.enqueue_count;
     context->completion_resolve_count = stats.completion.resolve_count;
-    context->ready_to_kernel_cycles = stats.completion.ready_to_kernel_cycles;
-    context->ready_to_kernel_max_cycles = stats.completion.ready_to_kernel_max_cycles;
     context->payload_cycles = stats.payload_cycles;
     context->kernel_cycles = stats.kernel_cycles;
     scheduler_publish_cache_line(&context->wake_cas_retry_count);
 
     context->completion_enqueue_cycles = stats.completion_enqueue_cycles;
     context->bootstrap_start_cycles = stats.bootstrap_start_cycles;
-    context->bootstrap_end_cycles = stats.bootstrap_end_cycles;
     context->drain_start_cycles = stats.drain_start_cycles;
     context->drain_end_cycles = stats.drain_end_cycles;
     context->exit_wait_start_cycles = stats.exit_wait_start_cycles;
@@ -174,128 +114,83 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
     scheduler_gm_publish(context->target_bootstrap_end_cycles, stats.target_bootstrap_end_cycles);
     scheduler_gm_publish(context->bootstrap_target_aic_cycles, stats.bootstrap_target_cycles[0]);
     scheduler_gm_publish(context->bootstrap_target_aiv_cycles, stats.bootstrap_target_cycles[1]);
-    scheduler_gm_publish(context->bootstrap_ready_claim_aic_cycles, stats.bootstrap_ready_claim_cycles[0]);
-    scheduler_gm_publish(context->bootstrap_ready_claim_aiv_cycles, stats.bootstrap_ready_claim_cycles[1]);
 }
 
-__aicore__ __attribute__((always_inline)) void commit_task_trace(
-    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, const SchedulerExecutionRecord &record,
-    uint64_t ready_scan_start, uint64_t ready_observe, uint64_t kernel_start, uint64_t kernel_end,
-    uint64_t completion_end, uint64_t bookkeeping_end, uint64_t previous_trace_commit_end, uint64_t aicore_entry_cycles,
-    uint64_t handshake_publish_cycles, uint64_t register_release_cycles, uint64_t descriptor_cache_observed_cycles,
-    uint64_t completion_id, uint64_t completion_inbox_index, const SchedulerInterTaskTiming &inter_task_timing
+// Keep the pre-kernel timestamps out of the indirect kernel call's live set.
+// Inlining this path makes the resident loop spill enough state to fault on A5.
+__aicore__ __attribute__((noinline)) void stage_task_trace_before_execution(
+    SchedulerExecutorTaskTrace *trace, uint64_t ready_scan_start, uint64_t ready_observe, uint64_t completion_id,
+    uint64_t completion_inbox_index, bool phase_timing_enabled
 ) {
-    __gm__ SchedulerTaskTrace *cells =
-        scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
-    __gm__ SchedulerTaskTrace *trace = &cells[record.task_id];
-    trace->ready_source = static_cast<uint64_t>(record.ready_source);
-    trace->worker_id = context->worker_index;
-    trace->task_id = static_cast<uint64_t>(record.task_id);
-    trace->claim_worker_id = record.claim_worker_id;
-    trace->claim_start_cycles = record.claim_start_cycles;
-    trace->claim_end_cycles = record.claim_end_cycles;
-    trace->previous_trace_commit_end_cycles = previous_trace_commit_end;
-    trace->kernel_start_cycles = kernel_start;
-    trace->kernel_end_cycles = kernel_end;
-    trace->completion_end_cycles = completion_end;
-    trace->ready_scan_start_cycles = ready_scan_start;
     trace->ready_observe_cycles = ready_observe;
-    trace->completion_bookkeeping_end_cycles = bookkeeping_end;
-    trace->completion_id = completion_id;
-    trace->completion_inbox_index = completion_inbox_index;
-    scheduler_observe_cache_line(&trace->ready_transition_cycles);
-    trace->inter_task_completion_service_cycles = inter_task_timing.completion_service_cycles;
-    trace->inter_task_dispatch_aic_cycles = inter_task_timing.dispatch_cycles[0];
-    trace->inter_task_dispatch_aiv_cycles = inter_task_timing.dispatch_cycles[1];
-    trace->inter_task_ready_poll_cycles = inter_task_timing.ready_poll_cycles;
-    trace->inter_task_backoff_cycles = inter_task_timing.backoff_cycles;
-    trace->inter_task_completion_scan_cycles = inter_task_timing.completion.scan_cycles;
-    trace->inter_task_completion_consume_cycles = inter_task_timing.completion.consume_cycles;
-    trace->inter_task_completion_resolve_cycles = inter_task_timing.completion.resolve_cycles;
-    trace->inter_task_completion_ready_publish_cycles = inter_task_timing.completion.ready_publish_cycles;
-    trace->inter_task_completion_refill_cycles = inter_task_timing.completion.refill_cycles;
-    trace->inter_task_completion_finalize_cycles = inter_task_timing.completion.finalize_cycles;
-    trace->inter_task_gang_service_cycles = inter_task_timing.gang_service_cycles;
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
-        trace->inter_task_dispatch_probe_cycles[type] = inter_task_timing.dispatch.probe_cycles[type];
-        trace->inter_task_dispatch_claim_cycles[type] = inter_task_timing.dispatch.claim_cycles[type];
-        trace->inter_task_dispatch_prepare_cycles[type] = inter_task_timing.dispatch.prepare_cycles[type];
-        trace->inter_task_dispatch_materialize_cycles[type] = inter_task_timing.dispatch.materialize_cycles[type];
-        trace->inter_task_dispatch_publish_cycles[type] = inter_task_timing.dispatch.publish_cycles[type];
+    if (phase_timing_enabled) {
+        trace->ready_scan_start_cycles = ready_scan_start;
+        trace->completion_id = completion_id;
+        trace->completion_inbox_index = completion_inbox_index;
     }
-    if (previous_trace_commit_end == 0) {
-        trace->aicore_entry_cycles = aicore_entry_cycles;
-        trace->handshake_publish_cycles = handshake_publish_cycles;
-        trace->register_release_cycles = register_release_cycles;
-        trace->descriptor_cache_observed_cycles = descriptor_cache_observed_cycles;
-        scheduler_publish_cache_line(&trace->register_release_cycles);
-    }
-    scheduler_publish_cache_line(&trace->kernel_start_cycles);
-    scheduler_publish_cache_line(&trace->ready_transition_cycles);
-    trace->valid = 1;
-    scheduler_publish_cache_line(trace);
 }
 
-__aicore__ __attribute__((always_inline)) void commit_task_timing_trace(
-    __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context, int64_t task_id, uint64_t kernel_start,
-    uint64_t kernel_end
-) {
-    __gm__ SchedulerTaskTrace *cells =
-        scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->trace_cells_offset);
-    __gm__ SchedulerTaskTrace *trace = &cells[task_id];
+// The Completion Inbox token follows this call, so the Scheduler cannot
+// observe a partial Executor trace.
+__aicore__ __attribute__((noinline)) void
+stage_task_trace_before_completion(SchedulerExecutorTaskTrace *trace, uint64_t kernel_start, uint64_t kernel_end) {
     trace->kernel_start_cycles = kernel_start;
     trace->kernel_end_cycles = kernel_end;
-    scheduler_publish_cache_line(&trace->kernel_start_cycles);
 }
 
 __aicore__ bool bootstrap_ready_graph(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *scheduler,
-    __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, SchedulerWorkerStats *stats, bool trace_enabled,
-    SchedulerDeferredAivQueue *deferred_aiv, __gm__ SchedulerReadyOwnerState *ready_owner
+    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
+    __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, SchedulerWorkerStats *stats,
+    uint64_t profiling_level, SchedulerDeferredAivQueue *deferred_aiv,
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
-    if (scheduler_count == 0 || scheduler->inbox_index >= scheduler_count || ready_owner == nullptr) return false;
-    if (trace_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
-    SchedulerReadyBatch batches[SCHEDULER_CORE_TYPE_COUNT]{};
+    if (scheduler_count == 0 || scheduler->config.scheduler_index >= scheduler_count || ssbuf_region == nullptr ||
+        scheduler == nullptr)
+        return false;
+    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
+    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
     uint64_t remainder = graph.task_count % scheduler_count;
-    uint64_t task_begin = scheduler->inbox_index * tasks_per_scheduler +
-                          (scheduler->inbox_index < remainder ? scheduler->inbox_index : remainder);
-    uint64_t task_end = task_begin + tasks_per_scheduler + (scheduler->inbox_index < remainder ? 1 : 0);
+    uint64_t task_begin =
+        scheduler->config.scheduler_index * tasks_per_scheduler +
+        (scheduler->config.scheduler_index < remainder ? scheduler->config.scheduler_index : remainder);
+    uint64_t task_end = task_begin + tasks_per_scheduler + (scheduler->config.scheduler_index < remainder ? 1 : 0);
     for (uint64_t task_id = task_begin; task_id < task_end; ++task_id) {
         __gm__ SchedulerTaskMetadata *metadata =
             scheduler_task_metadata_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_id));
         scheduler_observe_cache_line(metadata);
         if (!scheduler_task_is_executable(metadata->flags)) continue;
+        const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
         SchedulerRouteResult route =
-            scheduler_task_has_fanin(metadata->flags) ?
-                scheduler_bootstrap_route_task(
-                    graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_id), &stats->wake
-                ) :
-                SchedulerRouteResult::READY_TO_ENQUEUE;
+            has_fanin ? scheduler_bootstrap_route_task(
+                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_id),
+                            phase_timing_enabled ? &stats->wake : nullptr
+                        ) :
+                        SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE &&
-            !scheduler_bootstrap_ready_batch_append(
-                scheduler_state_base, scheduler, static_cast<int64_t>(task_id),
-                &batches[scheduler_metadata_core_type_index(scheduler_metadata_single_subtask_slot(metadata
-                                                                                                       ->active_mask))],
-                &stats->ready, trace_enabled
-            )) {
-            return false;
+        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
+            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, metadata->active_mask);
+            if (!scheduler_bootstrap_ready_batch_append(
+                    scheduler_state_base, scheduler, static_cast<int64_t>(task_id), &batches[core_type],
+                    phase_timing_enabled ? &stats->ready : nullptr, profiling_level
+                ))
+                return false;
         }
-        ++stats->bootstrap_task_count;
+        if (phase_timing_enabled) ++stats->bootstrap_task_count;
     }
     scheduler_cache_barrier();
     uint64_t ready_types = 0;
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         if (!scheduler_bootstrap_ready_batch_publish(
-                scheduler_state_base, scheduler, type, scheduler->inbox_index, &batches[type], &stats->ready,
-                &ready_types
+                scheduler_state_base, scheduler, type, scheduler->config.scheduler_index, &batches[type],
+                phase_timing_enabled ? &stats->ready : nullptr, &ready_types
             ))
             return false;
     }
     __gm__ SchedulerReadyDirectory *ready_directory = scheduler_ready_directory_at(scheduler_state_base, scheduler);
-    scheduler_gm_store(ready_directory->bootstrap_ready_types[scheduler->inbox_index], ready_types);
-    if (trace_enabled) stats->bootstrap_scan_end_cycles = scheduler_cycles();
+    scheduler_gm_store(ready_directory->bootstrap_ready_types[scheduler->config.scheduler_index], ready_types);
+    if (phase_timing_enabled) stats->bootstrap_scan_end_cycles = scheduler_cycles();
 
     uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) {
@@ -319,42 +214,37 @@ __aicore__ bool bootstrap_ready_graph(
             if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
         }
     }
-    for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
-        scheduler_gm_store(
-            ready_owner->queues[type].advertised, (ready_types & (UINT64_C(1) << type)) != 0 ? UINT64_C(1) : UINT64_C(0)
-        );
-    }
-    if (trace_enabled) stats->target_bootstrap_start_cycles = scheduler_cycles();
+    scheduler->owner_ready_queue_mask = static_cast<uint32_t>(ready_types);
+    if (phase_timing_enabled) stats->target_bootstrap_start_cycles = scheduler_cycles();
 
     for (uint32_t cluster_lane = 0; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {
-        const uint64_t worker_id = scheduler->cluster_worker_ids[cluster_lane];
-        uint64_t target_start = trace_enabled ? scheduler_cycles() : 0;
+        const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
+        uint64_t target_start = phase_timing_enabled ? scheduler_cycles() : 0;
         __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-        scheduler_observe_cache_line(target);
-        scheduler_observe_cache_line(&target->task_metadata_offset);
-        if (target->active == 0) continue;
         uint32_t type = scheduler_core_type_index(target->core_type);
         for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
-            __gm__ SchedulerDispatchSlot *slot =
-                scheduler_dispatch_slot_at(scheduler_state_base, scheduler, worker_id, slot_index);
-            scheduler_observe_cache_line(slot);
-            scheduler_initialize_free_slot(slot);
+            scheduler_initialize_free_slot(&scheduler->slots[cluster_lane][slot_index]);
         }
         scheduler_gm_publish(target->bootstrap_done, UINT64_C(1));
-        if (trace_enabled) stats->bootstrap_target_cycles[type] += scheduler_cycles() - target_start;
+        if (phase_timing_enabled) stats->bootstrap_target_cycles[type] += scheduler_cycles() - target_start;
     }
-    if (trace_enabled) stats->target_bootstrap_end_cycles = scheduler_cycles();
+    if (phase_timing_enabled) stats->target_bootstrap_end_cycles = scheduler_cycles();
 
     // Prepare the first executable wave while the sole DMB launch gate is
     // still closed.
-    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{
-        (scheduler->inbox_index + 1) % scheduler_count,
-        (scheduler->inbox_index + 1) % scheduler_count,
+    uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
+        (scheduler->config.scheduler_index + 1) % scheduler_count,
+        (scheduler->config.scheduler_index + 1) % scheduler_count,
     };
     bool fill_failed = false;
+    if (!scheduler_fill_cluster_mix_slots(
+            graph, scheduler_state_base, scheduler, run_control, &ready_victim_cursors[SCHEDULER_MIX_QUEUE],
+            phase_timing_enabled ? &stats->ready : nullptr, profiling_level, true, ssbuf_region, nullptr
+        ))
+        return false;
     (void)scheduler_fill_cluster_normal_slots(
-        graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors, &stats->ready, trace_enabled, 0,
-        nullptr, deferred_aiv, ready_owner, &fill_failed
+        graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors,
+        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, 0, deferred_aiv, &fill_failed, ssbuf_region
     );
     if (fill_failed) return false;
     // No peer can make progress while the launch gate is closed. Materialize
@@ -362,7 +252,8 @@ __aicore__ bool bootstrap_ready_graph(
     // never cross the bootstrap boundary.
     while (deferred_aiv != nullptr && deferred_aiv->count != 0) {
         if (!scheduler_publish_deferred_aiv_local(
-                graph, scheduler_state_base, scheduler, run_control, deferred_aiv, trace_enabled, nullptr
+                graph, scheduler_state_base, scheduler, run_control, deferred_aiv, profiling_level, nullptr,
+                ssbuf_region
             ))
             return false;
     }
@@ -371,41 +262,45 @@ __aicore__ bool bootstrap_ready_graph(
     // one and only DMB release. Schedulers do not wait on another barrier.
     arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) scheduler_gm_publish(run_control->bootstrap_complete, UINT64_C(1));
-    if (trace_enabled) stats->bootstrap_end_cycles = scheduler_cycles();
     return true;
 }
 
+// Keep all arguments register-passed. The local state owns the immutable
+// configuration; only the SSBUF base is derived inside the resident loop.
 __aicore__ bool run_ready_dispatch_loop(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, __gm__ SchedulerWorkerContext *context,
-    __gm__ SchedulerRunControl *run_control, SchedulerWorkerStats *stats, bool trace_enabled,
-    uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles, uint64_t register_release_cycles,
-    uint64_t descriptor_cache_observed_cycles, SchedulerDeferredAivQueue *deferred_aiv
+    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
+    __gm__ SchedulerRunControl *run_control, SchedulerWorkerStats *stats, uint64_t profiling_level,
+    SchedulerDeferredAivQueue *deferred_aiv
 ) {
-    uint64_t scheduler_count = scheduler_gm_query(run_control->scheduler_count);
-    bool scheduler_worker = context->is_scheduler != 0;
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region = scheduler_ssbuf_region(platform_ssbuf_hardware_base_address());
+    const uint32_t cluster_lane = context->config.self_lane;
+    const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
+    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    const uint64_t scheduler_count = context->config.scheduler_count;
+    bool scheduler_worker = context->is_scheduler();
     if (scheduler_count == 0) return false;
-    __gm__ SchedulerReadyOwnerState *ready_owner = nullptr;
-    if (scheduler_worker) {
-        ready_owner = scheduler_ready_owner_state_at(scheduler_state_base, context);
-    }
-    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{
-        scheduler_worker ? (context->inbox_index + 1) % scheduler_count : 0,
-        scheduler_worker ? (context->inbox_index + 1) % scheduler_count : 0,
+    if (ssbuf_region == nullptr || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
+    uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
+        scheduler_worker ? (context->config.scheduler_index + 1) % scheduler_count : 0,
+        scheduler_worker ? (context->config.scheduler_index + 1) % scheduler_count : 0,
     };
-    uint64_t seen_publication[SCHEDULER_PENDING_SLOT_COUNT]{};
-    uint64_t previous_trace_commit_end = 0;
-    uint64_t inter_task_start_cycles = register_release_cycles;
+    uint64_t completion_publication = 0;
     uint32_t scan_start = 0;
+    uint64_t next_dispatch_sequence = 1;
     uint32_t backoff_iterations = kInitialBackoffIterations;
     uint32_t scheduler_error_poll_count = 0;
-    SchedulerInterTaskTiming inter_task_timing{};
+    if (phase_timing_enabled) context->profiling->loop_iter = UINT32_MAX;
+    uint64_t idle_start_cycles = 0;
+    bool idle_active = false;
     while (true) {
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
-            if (trace_enabled) {
+            if (phase_timing_enabled) {
                 stats->exit_observed_cycles = get_sys_cnt_aicore();
-                publish_scheduler_tail_trace(
-                    context, inter_task_start_cycles, stats->exit_observed_cycles, inter_task_timing
-                );
+                if (scheduler_worker && idle_active) {
+                    scheduler_append_idle_activity(
+                        scheduler_state_base, context, idle_start_cycles, stats->exit_observed_cycles
+                    );
+                }
             }
             break;
         }
@@ -414,257 +309,422 @@ __aicore__ bool run_ready_dispatch_loop(
             if (scheduler_gm_query(run_control->scheduler_error) != 0) return false;
         }
 
+        if (phase_timing_enabled && scheduler_worker) ++context->profiling->loop_iter;
+        const uint64_t idle_candidate_start = phase_timing_enabled && scheduler_worker ? scheduler_cycles() : 0;
+
         bool scheduler_progress = false;
-        if (scheduler_worker && !scheduler_ready_owner_maintain(scheduler_state_base, context, ready_owner)) {
+        if (scheduler_worker && !scheduler_refresh_ready_inbox(scheduler_state_base, context)) {
             scheduler_record_error(
                 run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                SchedulerErrorSite::READY_OWNER_MAINTENANCE_FAILED
+                SchedulerErrorSite::READY_INBOX_REFRESH_FAILED
             );
             return false;
         }
-        uint32_t preferred_ready_slot = UINT32_MAX;
-        if (scheduler_worker && deferred_aiv != nullptr && deferred_aiv->count != 0) {
+        uint32_t published_local_slot = UINT32_MAX;
+        if (scheduler_worker && !context->has_mix && deferred_aiv != nullptr && deferred_aiv->count != 0) {
             const uint32_t deferred_before = deferred_aiv->count;
             if (!scheduler_drain_deferred_aiv_to_peer(
-                    graph, scheduler_state_base, context, run_control, deferred_aiv, &stats->wake, &stats->ready,
-                    &stats->completion, trace_enabled, nullptr, nullptr, ready_owner
+                    graph, scheduler_state_base, context, run_control, deferred_aiv,
+                    phase_timing_enabled ? &stats->wake : nullptr, phase_timing_enabled ? &stats->ready : nullptr,
+                    phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ssbuf_region
                 ))
                 return false;
             scheduler_progress = deferred_aiv->count != deferred_before;
             if (deferred_aiv->count != 0 && !scheduler_publish_deferred_aiv_local(
                                                 graph, scheduler_state_base, context, run_control, deferred_aiv,
-                                                trace_enabled, &preferred_ready_slot
+                                                profiling_level, &published_local_slot, ssbuf_region
                                             ))
                 return false;
         }
-        if (scheduler_worker && preferred_ready_slot == UINT32_MAX) {
-            uint64_t operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
+        if (scheduler_worker && published_local_slot == UINT32_MAX) {
             uint64_t direct_refilled_slot_mask = 0;
-            SchedulerCompletionServiceTiming completion_timing{};
+            SchedulerRefillCandidates refill_candidates(context->has_mix);
             const bool completion_progress = scheduler_service_cluster_completions(
-                graph, scheduler_state_base, context, run_control, &stats->wake, &stats->ready, &stats->completion,
-                ready_victim_cursors, trace_enabled, &direct_refilled_slot_mask,
-                trace_enabled ? &completion_timing : nullptr, ready_owner
+                graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
+                phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
+                ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ssbuf_region,
+                context->has_mix ? &refill_candidates : nullptr
             );
-            if (trace_enabled) {
-                uint64_t completion_total = get_sys_cnt_aicore() - operation_start;
-                uint64_t completion_detail = completion_timing.consume_cycles + completion_timing.resolve_cycles +
-                                             completion_timing.ready_publish_cycles + completion_timing.refill_cycles +
-                                             completion_timing.finalize_cycles;
-                completion_timing.scan_cycles +=
-                    completion_total > completion_detail ? completion_total - completion_detail : 0;
-                inter_task_timing.completion_service_cycles += completion_total;
-                inter_task_timing.completion.scan_cycles += completion_timing.scan_cycles;
-                inter_task_timing.completion.consume_cycles += completion_timing.consume_cycles;
-                inter_task_timing.completion.resolve_cycles += completion_timing.resolve_cycles;
-                inter_task_timing.completion.ready_publish_cycles += completion_timing.ready_publish_cycles;
-                inter_task_timing.completion.refill_cycles += completion_timing.refill_cycles;
-                inter_task_timing.completion.finalize_cycles += completion_timing.finalize_cycles;
-            }
             scheduler_progress = completion_progress;
-            operation_start = trace_enabled ? get_sys_cnt_aicore() : 0;
-            SchedulerNormalDispatchTiming dispatch_timing{};
+            if (!scheduler_fill_mix_after_completions(
+                    graph, scheduler_state_base, context, run_control, &refill_candidates.mix_ready,
+                    &ready_victim_cursors[SCHEDULER_MIX_QUEUE], phase_timing_enabled ? &stats->ready : nullptr,
+                    profiling_level, deferred_aiv == nullptr || deferred_aiv->count == 0, ssbuf_region,
+                    &scheduler_progress
+                ))
+                return false;
+            if (context->has_mix && !scheduler_publish_refill_candidates(
+                                        graph, scheduler_state_base, context, run_control, &refill_candidates,
+                                        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, ssbuf_region
+                                    ))
+                return false;
             bool fill_failed = false;
             const bool dispatch_progress = scheduler_fill_cluster_normal_slots(
-                graph, scheduler_state_base, context, run_control, ready_victim_cursors, &stats->ready, trace_enabled,
-                direct_refilled_slot_mask, trace_enabled ? &dispatch_timing : nullptr, deferred_aiv, ready_owner,
-                &fill_failed
+                graph, scheduler_state_base, context, run_control, ready_victim_cursors,
+                phase_timing_enabled ? &stats->ready : nullptr, profiling_level, direct_refilled_slot_mask,
+                deferred_aiv, &fill_failed, ssbuf_region
             );
             scheduler_progress = dispatch_progress || scheduler_progress;
             if (fill_failed) return false;
-            if (trace_enabled) {
-                inter_task_timing.dispatch_cycles[0] += get_sys_cnt_aicore() - operation_start;
-                for (uint32_t type = 0; type < SCHEDULER_CORE_TYPE_COUNT; ++type) {
-                    inter_task_timing.dispatch.probe_cycles[type] += dispatch_timing.probe_cycles[type];
-                    inter_task_timing.dispatch.claim_cycles[type] += dispatch_timing.claim_cycles[type];
-                    inter_task_timing.dispatch.prepare_cycles[type] += dispatch_timing.prepare_cycles[type];
-                    inter_task_timing.dispatch.materialize_cycles[type] += dispatch_timing.materialize_cycles[type];
-                    inter_task_timing.dispatch.publish_cycles[type] += dispatch_timing.publish_cycles[type];
-                }
-            }
             if (deferred_aiv != nullptr && deferred_aiv->count != 0) {
                 const uint32_t deferred_before = deferred_aiv->count;
                 if (!scheduler_drain_deferred_aiv_to_peer(
-                        graph, scheduler_state_base, context, run_control, deferred_aiv, &stats->wake, &stats->ready,
-                        &stats->completion, trace_enabled, nullptr, nullptr, ready_owner
+                        graph, scheduler_state_base, context, run_control, deferred_aiv,
+                        phase_timing_enabled ? &stats->wake : nullptr, phase_timing_enabled ? &stats->ready : nullptr,
+                        phase_timing_enabled ? &stats->completion : nullptr, profiling_level, ssbuf_region
                     ))
                     return false;
                 scheduler_progress = scheduler_progress || deferred_aiv->count != deferred_before;
                 if (deferred_aiv->count != 0 && !scheduler_publish_deferred_aiv_local(
                                                     graph, scheduler_state_base, context, run_control, deferred_aiv,
-                                                    trace_enabled, &preferred_ready_slot
+                                                    profiling_level, &published_local_slot, ssbuf_region
                                                 ))
                     return false;
             }
         }
 
+        if (phase_timing_enabled && scheduler_worker && scheduler_progress && idle_active) {
+            scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, idle_candidate_start);
+            idle_active = false;
+        }
+
         int32_t ready_slot = -1;
+        uint32_t ready_generation = 0;
         uint64_t ready_publication = 0;
-        uint64_t ready_scan_start = trace_enabled ? get_sys_cnt_aicore() : 0;
-        if (preferred_ready_slot != UINT32_MAX) {
-            __gm__ SchedulerDispatchSlot *slot =
-                scheduler_dispatch_slot_at(scheduler_state_base, context, context->worker_index, preferred_ready_slot);
-            const uint64_t publication = scheduler_gm_query(slot->publication);
-            ++stats->task_state_poll_count;
-            if (publication == seen_publication[preferred_ready_slot] ||
-                scheduler_dispatch_state(publication) != SchedulerDispatchSlotState::READY) {
-                scheduler_record_error(
-                    run_control, slot->task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
-                );
-                return false;
+        uint64_t ready_scan_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+        if (scheduler_worker) {
+            uint32_t local_slot = UINT32_MAX;
+            uint64_t local_generation = 0;
+            if (scheduler_local_ready_pop(context, &local_slot, &local_generation)) {
+                if (scheduler_dispatch_state(local_generation) != SchedulerDispatchSlotState::READY ||
+                    scheduler_dispatch_generation(local_generation) == 0 ||
+                    scheduler_dispatch_generation(local_generation) != next_dispatch_sequence) {
+                    scheduler_record_error(
+                        run_control, context->slots[cluster_lane][local_slot].task_id,
+                        SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                        SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
+                    );
+                    return false;
+                }
+                ready_slot = static_cast<int32_t>(local_slot);
+                ready_generation = scheduler_dispatch_generation(local_generation);
             }
-            ready_slot = static_cast<int32_t>(preferred_ready_slot);
-            ready_publication = publication;
         } else {
             for (uint32_t offset = 0; offset < SCHEDULER_PENDING_SLOT_COUNT; ++offset) {
                 uint32_t slot_index = (scan_start + offset) % SCHEDULER_PENDING_SLOT_COUNT;
-                __gm__ SchedulerDispatchSlot *slot =
-                    scheduler_dispatch_slot_at(scheduler_state_base, context, context->worker_index, slot_index);
-                uint64_t publication = scheduler_gm_query(slot->publication);
-                ++stats->task_state_poll_count;
-                if (publication != seen_publication[slot_index] &&
-                    scheduler_dispatch_state(publication) == SchedulerDispatchSlotState::READY) {
+                const uint64_t publication =
+                    scheduler_ssbuf_load_relaxed(&ssbuf_region->lanes[cluster_lane].dispatch[slot_index].publication);
+                const uint32_t generation = static_cast<uint32_t>(publication);
+                if (phase_timing_enabled) ++stats->task_state_poll_count;
+                if (generation == next_dispatch_sequence) {
                     ready_slot = static_cast<int32_t>(slot_index);
+                    ready_generation = generation;
                     ready_publication = publication;
                     break;
                 }
             }
         }
-        uint64_t ready_poll_end = trace_enabled ? get_sys_cnt_aicore() : 0;
-
         if (ready_slot >= 0) {
             uint32_t slot_index = static_cast<uint32_t>(ready_slot);
-            __gm__ SchedulerDispatchSlot *slot =
-                scheduler_dispatch_slot_at(scheduler_state_base, context, context->worker_index, slot_index);
+            SchedulerLocalSlotState *local_slot = &context->slots[cluster_lane][slot_index];
+            const SCHEDULER_SSBUF volatile SchedulerSsbufDispatchControl *ssbuf_control =
+                &ssbuf_region->lanes[cluster_lane].dispatch[slot_index];
+            const int32_t timing_slot = scheduler_worker ? context->timing_slot(cluster_lane, slot_index) :
+                                                           static_cast<int32_t>(ready_publication >> 32);
             __gm__ DispatchPayload *payload = scheduler_state_at<DispatchPayload>(
-                scheduler_state_base,
-                context->dispatch_payload_offset + static_cast<uint64_t>(slot_index) * sizeof(DispatchPayload)
+                scheduler_state_base, context->dispatch_payload_offset(context->config.self_lane, slot_index)
             );
-            uint64_t ready_observe = get_sys_cnt_aicore();
-            scheduler_invalidate_cache_line(slot);
-            scheduler_observe_dispatch_payload_control(payload);
-            scheduler_observe_dispatch_payload_arguments(payload);
-            scheduler_observe_dispatch_payload_barrier();
-            if (slot->pending_slot != slot_index || slot->task_id < 0 ||
-                static_cast<uint64_t>(slot->task_id) >= graph.task_count ||
-                slot->generation != scheduler_dispatch_generation(ready_publication)) {
+            const bool commit_scheduler_trace = task_timing_enabled;
+            const bool commit_task_timing = timing_slot >= 0 && timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT;
+            const bool commit_executor_trace = commit_scheduler_trace || commit_task_timing;
+            uint64_t ready_observe = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            if (phase_timing_enabled && scheduler_worker && idle_active) {
+                scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, ready_observe);
+                idle_active = false;
+            }
+            if (!scheduler_worker) {
+                scheduler_observe_dispatch_payload_control(payload);
+                scheduler_observe_dispatch_payload_arguments(payload);
+                scheduler_observe_dispatch_payload_barrier();
+            }
+            const int64_t task_id = scheduler_worker ? local_slot->task_id : ssbuf_control->task_id;
+            if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count || ready_generation == 0) {
                 scheduler_record_error(
-                    run_control, slot->task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
                 );
                 return false;
             }
-            seen_publication[slot_index] = ready_publication;
-            SchedulerExecutionRecord record{
-                slot->task_id,
-                slot->claim_worker_id,
-                slot->claim_start_cycles,
-                slot->claim_end_cycles,
-                static_cast<SchedulerReadySource>(slot->ready_source),
-            };
-            const bool commit_scheduler_trace =
-                trace_enabled && should_commit_scheduler_trace(scheduler_state_base, context, slot);
-            __gm__ SchedulerTaskMetadata *task_metadata =
-                scheduler_task_metadata_at(scheduler_state_base, context, record.task_id);
-            scheduler_observe_cache_line(task_metadata);
-            const bool commit_task_timing = task_metadata->timing_slot >= 0 &&
-                                            task_metadata->timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT &&
-                                            should_commit_scheduler_trace(scheduler_state_base, context, slot);
+            ++next_dispatch_sequence;
+            SchedulerExecutorTaskTrace execution_trace{};
+            if (commit_scheduler_trace || commit_task_timing) {
+                uint64_t local_completion_index = stats->completion.enqueue_count;
+                stage_task_trace_before_execution(
+                    &execution_trace, ready_scan_start, ready_observe,
+                    scheduler_completion_id(context, local_completion_index), context->config.scheduler_index,
+                    phase_timing_enabled
+                );
+            }
             OUT_OF_ORDER_STORE_BARRIER();
-            uint64_t kernel_start = get_sys_cnt_aicore();
-            if (trace_enabled) {
-                __gm__ SchedulerTaskControl *control =
-                    scheduler_task_control_at(scheduler_state_base, context, record.task_id);
-                scheduler_observe_cache_line(&control->next_waiter);
-                if (control->ready_publish_cycles != 0 && kernel_start >= control->ready_publish_cycles) {
-                    uint64_t lag = kernel_start - control->ready_publish_cycles;
-                    stats->completion.ready_to_kernel_cycles += lag;
-                    if (lag > stats->completion.ready_to_kernel_max_cycles)
-                        stats->completion.ready_to_kernel_max_cycles = lag;
+            uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            execute_task(payload);
+            uint64_t kernel_end = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
+            if (scheduler_worker) {
+                if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
+            } else {
+                if (commit_executor_trace) {
+                    SCHEDULER_SSBUF volatile SchedulerExecutorTaskTrace *published_trace =
+                        &ssbuf_region->lanes[cluster_lane].traces[slot_index].payload;
+                    published_trace->kernel_start_cycles = execution_trace.kernel_start_cycles;
+                    published_trace->kernel_end_cycles = execution_trace.kernel_end_cycles;
+                    published_trace->ready_scan_start_cycles = execution_trace.ready_scan_start_cycles;
+                    published_trace->ready_observe_cycles = execution_trace.ready_observe_cycles;
+                    published_trace->completion_id = execution_trace.completion_id;
+                    published_trace->completion_inbox_index = execution_trace.completion_inbox_index;
                 }
             }
-            execute_task(payload);
-            uint64_t kernel_end = get_sys_cnt_aicore();
-            scheduler_publish_dispatch_payload(payload);
-            uint64_t completion_start = get_sys_cnt_aicore();
-            uint64_t local_completion_index = stats->completion.enqueue_count;
-            uint64_t completion_id = scheduler_completion_id(context, local_completion_index);
-            uint64_t completion_inbox_index = context->scheduler_index;
-            __gm__ SchedulerCompletionInbox *completion_line =
-                scheduler_completion_inbox_at(scheduler_state_base, context, context->worker_index);
-            scheduler_gm_store(completion_line->completed_generations[slot_index], slot->generation);
-            ++stats->completion.enqueue_count;
-            uint64_t completion_end = get_sys_cnt_aicore();
-            ++stats->executed_task_count;
-            stats->payload_cycles += kernel_start - ready_observe;
-            stats->kernel_cycles += kernel_end - kernel_start;
-            stats->completion_enqueue_cycles += completion_end - completion_start;
+            uint64_t completion_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            if (scheduler_worker) {
+                context->local_completed_generations[slot_index] = ready_generation;
+            } else {
+                completion_publication =
+                    scheduler_ssbuf_update_completion(completion_publication, slot_index, ready_generation);
+                scheduler_cache_barrier();
+                scheduler_ssbuf_store_relaxed(
+                    &ssbuf_region->lanes[cluster_lane].completion.publication, completion_publication
+                );
+            }
+            if (phase_timing_enabled) ++stats->completion.enqueue_count;
+            uint64_t completion_end = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            if (phase_timing_enabled) {
+                ++stats->executed_task_count;
+                stats->payload_cycles += kernel_start - ready_observe;
+                stats->kernel_cycles += kernel_end - kernel_start;
+                stats->completion_enqueue_cycles += completion_end - completion_start;
+            }
             scan_start = (slot_index + 1) % SCHEDULER_PENDING_SLOT_COUNT;
             backoff_iterations = kInitialBackoffIterations;
-            if (commit_scheduler_trace) {
-                uint64_t bookkeeping_end = get_sys_cnt_aicore();
-                commit_task_trace(
-                    scheduler_state_base, context, record, ready_scan_start, ready_observe, kernel_start, kernel_end,
-                    completion_end, bookkeeping_end, previous_trace_commit_end, aicore_entry_cycles,
-                    handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles, completion_id,
-                    completion_inbox_index, inter_task_timing
-                );
-                previous_trace_commit_end = get_sys_cnt_aicore();
-                inter_task_start_cycles = previous_trace_commit_end;
-            } else if (commit_task_timing) {
-                commit_task_timing_trace(scheduler_state_base, context, record.task_id, kernel_start, kernel_end);
-            } else if (trace_enabled) {
-                inter_task_start_cycles = get_sys_cnt_aicore();
-            }
-            inter_task_timing.reset();
             continue;
         }
-
-        if (trace_enabled) inter_task_timing.ready_poll_cycles += ready_poll_end - ready_scan_start;
 
         if (scheduler_progress) {
             backoff_iterations = kInitialBackoffIterations;
             continue;
         }
-        ++stats->idle_iteration_count;
+        // Deferred AIV reservations still have work to dispatch, so this pass is not idle.
+        if (scheduler_worker && (deferred_aiv == nullptr || deferred_aiv->count == 0))
+            scheduler_flush_completions(run_control, context);
+        if (phase_timing_enabled) ++stats->idle_iteration_count;
         uint64_t backoff_start = get_sys_cnt_aicore();
         local_backoff(backoff_iterations);
         uint64_t backoff_end = get_sys_cnt_aicore();
-        stats->backoff_cycles += backoff_end - backoff_start;
-        if (trace_enabled) inter_task_timing.backoff_cycles += backoff_end - backoff_start;
+        if (phase_timing_enabled) stats->backoff_cycles += backoff_end - backoff_start;
+        if (phase_timing_enabled) {
+            if (scheduler_worker && !idle_active) {
+                idle_start_cycles = idle_candidate_start;
+                idle_active = true;
+            }
+        }
         if (backoff_iterations < kMaximumBackoffIterations) backoff_iterations <<= 1;
     }
     return true;
 }
 
+struct SchedulerNoProfilingState {};
+
+template <bool WithProfiling>
+__aicore__ __attribute__((noinline)) void run_resident_scheduler(
+    __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
+    uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
+) {
+    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    SchedulerGraphView graph{
+        context->graph_storage_address,
+        context->graph_reserved_address,
+        context->graph_task_count,
+        context->task_window_last_index,
+    };
+    SchedulerWorkerStats stats{};
+    SchedulerDeferredAivQueue deferred_aiv{};
+    std::conditional_t<WithProfiling, SchedulerLocalProfilingState, SchedulerNoProfilingState> profile{};
+    SchedulerLocalState scheduler_local_state{};
+    if constexpr (WithProfiling) scheduler_local_state.profiling = &profile;
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region = scheduler_ssbuf_region(platform_ssbuf_hardware_base_address());
+    const bool config_valid =
+        scheduler_initialize_local_config(scheduler_state_base, context, &graph, &scheduler_local_state);
+    if (!config_valid)
+        scheduler_record_error(
+            run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+            SchedulerErrorSite::BOOTSTRAP_FAILED
+        );
+    const uint32_t cluster_lane = scheduler_local_state.config.self_lane;
+    const uint32_t scheduler_lane = scheduler_local_state.config.scheduler_lane;
+    uint64_t descriptor_cache_observed_cycles = 0;
+    if (config_valid) {
+        scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.storage_address));
+        descriptor_cache_observed_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+        if (context->is_scheduler != 0) {
+            scheduler_ssbuf_initialize(ssbuf_region, scheduler_lane);
+        }
+        if (context->is_scheduler != 0 &&
+            !bootstrap_ready_graph(
+                graph, scheduler_state_base, &scheduler_local_state, run_control,
+                scheduler_local_state.config.scheduler_count, &stats, profiling_level, &deferred_aiv, ssbuf_region
+            )) {
+            scheduler_record_error(
+                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                SchedulerErrorSite::BOOTSTRAP_FAILED
+            );
+        }
+    }
+
+    // Sole AICore-wide DMB: after this point a prepared slot may execute.
+    uint32_t startup_signal = 0;
+    bool register_release_timed_out = false;
+    const uint64_t register_wait_start = get_sys_cnt_aicore();
+    while (startup_signal != AICPU_IDLE_TASK_ID && startup_signal != AICORE_EXIT_SIGNAL) {
+        startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        if (scheduler_watchdog_expired(
+                register_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
+            )) {
+            scheduler_record_error(
+                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
+                SchedulerErrorSite::REGISTER_RELEASE_TIMEOUT
+            );
+            register_release_timed_out = true;
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+    if (startup_signal == AICORE_EXIT_SIGNAL || register_release_timed_out) {
+        if (phase_timing_enabled) stats.exit_observed_cycles = get_sys_cnt_aicore();
+    } else {
+        uint64_t register_release_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+        if (phase_timing_enabled) {
+            context->trace_aicore_entry_cycles = aicore_entry_cycles;
+            context->trace_handshake_publish_cycles = handshake_publish_cycles;
+            context->trace_register_release_cycles = register_release_cycles;
+            context->trace_descriptor_cache_observed_cycles = descriptor_cache_observed_cycles;
+            scheduler_publish_cache_line(&context->trace_aicore_entry_cycles);
+            scheduler_publish_cache_line(&context->trace_register_release_cycles);
+        }
+        write_reg(RegId::COND, AICORE_IDLE_VALUE);
+        if (config_valid) {
+            if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || scheduler_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+                !scheduler_ssbuf_is_initialized(ssbuf_region, scheduler_lane)) {
+                scheduler_record_error(
+                    run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
+                );
+            } else {
+                (void)run_ready_dispatch_loop(
+                    graph, scheduler_state_base, &scheduler_local_state, run_control, &stats, profiling_level,
+                    &deferred_aiv
+                );
+            }
+        }
+    }
+
+    scheduler_flush_completions(run_control, &scheduler_local_state);
+
+    if (phase_timing_enabled && stats.exit_wait_start_cycles == 0) stats.exit_wait_start_cycles = get_sys_cnt_aicore();
+    const uint64_t exit_wait_start = get_sys_cnt_aicore();
+    while (stats.exit_observed_cycles == 0 &&
+           static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
+        if (scheduler_watchdog_expired(
+                exit_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
+            )) {
+            scheduler_record_error(
+                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
+                SchedulerErrorSite::EXIT_WAIT_TIMEOUT
+            );
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+    if (phase_timing_enabled && stats.exit_observed_cycles == 0) stats.exit_observed_cycles = get_sys_cnt_aicore();
+    if (phase_timing_enabled) {
+        stats.final_stats_publish_start_cycles = get_sys_cnt_aicore();
+        publish_worker_stats(context, stats);
+        stats.final_stats_publish_end_cycles = get_sys_cnt_aicore();
+        stats.exit_ack_publish_cycles = get_sys_cnt_aicore();
+        context->final_stats_publish_end_cycles = stats.final_stats_publish_end_cycles;
+        context->exit_ack_publish_cycles = stats.exit_ack_publish_cycles;
+        scheduler_publish_cache_line(&context->completion_enqueue_cycles);
+    }
+    // A local register/exit watchdog may have ended the loop without AICPU
+    // signalling EXIT. Its current-run signal is published after the return
+    // gate reset, so wait for it before making the acknowledgement visible.
+    // The finalizer also folds this core's `scheduler_error` once observed.
+    wait_for_aicpu_exit_signal();
+    // Complete preceding GM writes before ACK. Stays outside profiling: the
+    // tail is optional, this ordering is not.
+    OUT_OF_ORDER_STORE_BARRIER();
+    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+}
+
 }  // namespace
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
-    __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->workers[block_idx]);
+    // The host's selection and its bootstrap address are on their own line, so
+    // observing the handshake line does not observe them. One observe covers the
+    // whole struct because it is exactly one 64-byte line.
+    __gm__ SchedulerBootstrapInputs *bootstrap = &runtime->dev.scheduler_bootstrap;
+    scheduler_observe_cache_line(bootstrap);
+    const uint32_t runtime_mode = bootstrap->runtime_mode;
+    __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
-    if ((handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
-         handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY)) {
+    if (runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
+        runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) {
         legacy_aicore_execute(runtime, block_idx, core_type);
+        wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
         return;
     }
-    bool trace_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
-    uint64_t aicore_entry_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
-    handshake->physical_core_id = get_physical_core_id();
-    handshake->core_type = core_type;
-    OUT_OF_ORDER_STORE_BARRIER();
-    handshake->aicore_done = block_idx + 1;
+    const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    uint64_t aicore_entry_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+    const uint64_t report_epoch = get_aicore_report_epoch();
+    if (report_epoch != 0) {
+        // Native program run. Everything this report stands for is payload —
+        // `aicore_done` and the two reverse-hand-off words this core is about
+        // to wait on, which a predecessor run left set. Clearing them before
+        // the marker is what makes an accepted report also mean "READY is not
+        // last run's". `report_epoch` alone comes after the barrier, so the
+        // AICPU cannot see this run's epoch without all of it.
+        //
+        // Only a stamped run may clear them: an unstamped one cannot tell its
+        // own leftovers from a predecessor's, and its AICPU does not gate the
+        // reply on the epoch either.
+        aicore_stage_native_report(
+            handshake, get_physical_core_id(), core_type, static_cast<uint32_t>(block_idx) + 1,
+            SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING
+        );
+        OUT_OF_ORDER_STORE_BARRIER();
+        handshake->report_epoch = report_epoch;
+    } else {
+        // Kernel/persistent launch: unchanged. `aicore_done` is itself the
+        // marker, its per-run reset is what makes it meaningful, and no stamp
+        // is written.
+        handshake->physical_core_id = get_physical_core_id();
+        handshake->core_type = core_type;
+        OUT_OF_ORDER_STORE_BARRIER();
+        handshake->aicore_done = block_idx + 1;
+    }
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
-    uint64_t handshake_publish_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
+    uint64_t handshake_publish_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
 
     // AICPU publishes the fully configured context through GM. This lets
     // AICore perform all pre-kernel work without consuming a DMB launch.
-    // Host publishes enough immutable scheduler-state addressing for the READY
-    // watchdog. AICPU fills the topology-dependent context fields before READY,
-    // so this pre-publish view must not be reused for execution.
-    __gm__ SchedulerWorkerContext *pending_context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(handshake->task);
+    // The host-published base plus this core's index gives the same address the
+    // AICPU republishes on the handshake at hand-off, so it carries enough
+    // immutable scheduler-state addressing for the READY watchdog. AICPU fills
+    // the topology-dependent context fields before READY, so this pre-publish
+    // view must not be reused for execution.
+    __gm__ SchedulerWorkerContext *pending_context = reinterpret_cast<__gm__ SchedulerWorkerContext *>(
+        scheduler_worker_context_address(bootstrap->worker_context_base, block_idx)
+    );
     scheduler_observe_cache_line(pending_context);
     __gm__ void *pending_scheduler_state_base =
         reinterpret_cast<__gm__ void *>(pending_context->scheduler_state_base_address);
@@ -694,7 +754,17 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         SPIN_WAIT_HINT();
     }
     if (startup_signal == AICORE_EXIT_SIGNAL) {
+        // A local watchdog or scheduler error can request exit before AICPU
+        // has reset this run's return gate. Wait for its actual DMB EXIT,
+        // which AICPU publishes only after that reset. Do this before ACK:
+        // after ACK the AICPU may close the window back to IDLE.
+        wait_for_aicpu_exit_signal();
+        // The AICPU reads this acknowledgement as the point this core's writes
+        // have landed, and the timeout above publishes its error through
+        // `pending_run_control`. Complete the preceding GM writes first.
+        OUT_OF_ORDER_STORE_BARRIER();
         write_reg(RegId::COND, AICORE_EXITED_VALUE);
+        wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
         return;
     }
 
@@ -708,90 +778,17 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ SchedulerRunControl *run_control =
         scheduler_state_at<SchedulerRunControl>(scheduler_state_base, context->run_control_offset);
     scheduler_observe_cache_line(run_control);
-    SchedulerGraphView graph{
-        context->graph_storage_address,
-        context->graph_reserved_address,
-        context->graph_task_count,
-        context->task_window_last_index,
-    };
-    SchedulerWorkerStats stats{};
-    SchedulerDeferredAivQueue deferred_aiv{};
-    __gm__ SchedulerReadyOwnerState *ready_owner = nullptr;
-    uint64_t descriptor_cache_observed_cycles = 0;
-    if (context->active != 0) {
-        scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.storage_address));
-        descriptor_cache_observed_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
-        if (context->is_scheduler != 0) {
-            ready_owner = scheduler_ready_owner_state_at(scheduler_state_base, context);
-            scheduler_ready_owner_init(ready_owner);
-        }
-        if (context->is_scheduler != 0 &&
-            !bootstrap_ready_graph(
-                graph, scheduler_state_base, context, run_control, scheduler_gm_query(run_control->scheduler_count),
-                &stats, trace_enabled, &deferred_aiv, ready_owner
-            )) {
-            scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                SchedulerErrorSite::BOOTSTRAP_FAILED
-            );
-        }
-    }
-
-    // Sole AICore-wide DMB: after this point a prepared slot may execute.
-    startup_signal = 0;
-    bool register_release_timed_out = false;
-    const uint64_t register_wait_start = get_sys_cnt_aicore();
-    while (startup_signal != AICPU_IDLE_TASK_ID && startup_signal != AICORE_EXIT_SIGNAL) {
-        startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-        if (scheduler_watchdog_expired(
-                register_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
-            )) {
-            scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
-                SchedulerErrorSite::REGISTER_RELEASE_TIMEOUT
-            );
-            register_release_timed_out = true;
-            break;
-        }
-        SPIN_WAIT_HINT();
-    }
-    if (startup_signal == AICORE_EXIT_SIGNAL || register_release_timed_out) {
-        if (trace_enabled) stats.exit_observed_cycles = get_sys_cnt_aicore();
+    scheduler_observe_cache_line(&run_control->chip_swimlane_level);
+    const uint64_t profiling_level = scheduler_gm_query(run_control->chip_swimlane_level);
+    if (scheduler_task_timing_enabled(profiling_level) ||
+        scheduler_gm_query(run_control->sampled_task_timing_enabled) != 0) {
+        run_resident_scheduler<true>(
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+        );
     } else {
-        uint64_t register_release_cycles = trace_enabled ? get_sys_cnt_aicore() : 0;
-        write_reg(RegId::COND, AICORE_IDLE_VALUE);
-        if (context->active != 0) {
-            (void)run_ready_dispatch_loop(
-                graph, scheduler_state_base, context, run_control, &stats, trace_enabled, aicore_entry_cycles,
-                handshake_publish_cycles, register_release_cycles, descriptor_cache_observed_cycles, &deferred_aiv
-            );
-        }
+        run_resident_scheduler<false>(
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+        );
     }
-
-    if (trace_enabled && stats.exit_wait_start_cycles == 0) stats.exit_wait_start_cycles = get_sys_cnt_aicore();
-    const uint64_t exit_wait_start = get_sys_cnt_aicore();
-    while (stats.exit_observed_cycles == 0 &&
-           static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
-        if (scheduler_watchdog_expired(
-                exit_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
-            )) {
-            scheduler_record_error(
-                run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
-                SchedulerErrorSite::EXIT_WAIT_TIMEOUT
-            );
-            break;
-        }
-        SPIN_WAIT_HINT();
-    }
-    if (trace_enabled && stats.exit_observed_cycles == 0) stats.exit_observed_cycles = get_sys_cnt_aicore();
-    if (trace_enabled) stats.final_stats_publish_start_cycles = get_sys_cnt_aicore();
-    publish_worker_stats(context, stats);
-    if (trace_enabled) {
-        stats.final_stats_publish_end_cycles = get_sys_cnt_aicore();
-        stats.exit_ack_publish_cycles = get_sys_cnt_aicore();
-        context->final_stats_publish_end_cycles = stats.final_stats_publish_end_cycles;
-        context->exit_ack_publish_cycles = stats.exit_ack_publish_cycles;
-        scheduler_publish_cache_line(&context->completion_enqueue_cycles);
-    }
-    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+    wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
 }

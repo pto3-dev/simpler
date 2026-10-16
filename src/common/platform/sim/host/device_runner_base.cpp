@@ -13,6 +13,11 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -29,9 +34,19 @@
 #include "chip_callable_layout.h"
 #include "common/host_api.h"
 #include "cpu_sim_context.h"
+#include "host/host_phase_records_artifact.h"
 #include "host/raii_scope_guard.h"
+#include "host/run_boundary.h"
 #include "task_args_wire.h"
 #include "utils/elf_build_id.h"
+
+// The host-orchestrating runtime's graph hand-off, and a weak fallback for a
+// runtime that captures on the device: its `dep_gen_host_graph_active()` is
+// false, so the runner never asks it for a graph. File scope, like the runner
+// method that takes its address and like the arch runners that define it:
+// `extern "C"` names the symbol, but lookup is still scoped, so a declaration
+// inside this file's own namespace is invisible to `SimDeviceRunnerBase` below.
+extern "C" int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport *out);
 
 namespace simpler::common::sim_host {
 
@@ -112,6 +127,77 @@ bool SimDeviceRunnerBase::native_run_active() const {
 
 bool SimDeviceRunnerBase::native_run_owned_by(const void *owner) const {
     return owner != nullptr && active_native_run_.load(std::memory_order_acquire) == owner;
+}
+
+/**
+ * Build every per-set resource for `granted`, publish none.
+ *
+ * Phase one of the grant, for the same reason the onboard runner splits it:
+ * resizing members one at a time leaves the earlier tables at the new count and
+ * the later ones at the old, and leaves the pointer-held bank table holding
+ * nulls that every reader and the whole cleanup path dereference.
+ */
+SimDeviceRunnerBase::RunResourceStaging SimDeviceRunnerBase::build_run_resources(size_t granted) {
+    RunResourceStaging staged;
+    staged.retained_temp_addrs = RunResourceSlots<void *>::build(granted);
+    staged.retained_temp_sizes = RunResourceSlots<size_t>::build(granted);
+    staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
+    staged.scheduler_state_storage = RunResourceSlots<RetainedSchedulerStorage>::build(granted);
+    staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
+    staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
+    staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
+    staged.host_phase_runs = RunResourceSlots<HostPhaseRunState>::build(granted);
+    staged.device_run_results = RunResourceSlots<DeviceRunResultRegion>::build(granted);
+    // The bank carries constructor arguments. Built here rather than filled in
+    // after a resize, so the table is never visible holding a null entry.
+    staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
+    for (std::unique_ptr<ArenaBank> &bank : staged.arena_banks) {
+        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
+    }
+    return staged;
+}
+
+/** Adopt a built grant by swapping every container. Never throws. */
+void SimDeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept {
+    retained_temp_addrs_.commit(std::move(staged.retained_temp_addrs));
+    retained_temp_sizes_.commit(std::move(staged.retained_temp_sizes));
+    graph_definition_staging_.commit(std::move(staged.graph_definition_staging));
+    scheduler_state_storage_.commit(std::move(staged.scheduler_state_storage));
+    orchestration_scratch_.commit(std::move(staged.orchestration_scratch));
+    sm_mirrors_.commit(std::move(staged.sm_mirrors));
+    run_image_stagings_.commit(std::move(staged.run_image_stagings));
+    arena_banks_.commit(std::move(staged.arena_banks));
+    host_phase_runs_.commit(std::move(staged.host_phase_runs));
+    device_run_results_.commit(std::move(staged.device_run_results));
+    // Last: until this is published, no run may name a set in the new tables.
+    granted_run_resource_sets_ = granted;
+}
+
+bool SimDeviceRunnerBase::set_run_resource_grant(size_t granted) {
+    if (granted == 0) return false;
+    if (granted == granted_run_resource_sets_) return true;
+    // Anything already committed belongs to a set at its current index, and a
+    // run's lease names its set by that index.
+    if (active_native_run_.load(std::memory_order_acquire) != nullptr) return false;
+    for (const std::unique_ptr<ArenaBank> &bank : arena_banks_) {
+        if (bank != nullptr &&
+            (bank->gm_heap.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed())) {
+            return false;
+        }
+    }
+    // Build first, publish second: a failure here leaves the previous grant
+    // whole and usable rather than a corrupted runner that cleanup then walks.
+    try {
+        RunResourceStaging staged = build_run_resources(granted);
+        commit_run_resources(granted, std::move(staged));
+    } catch (...) {
+        LOG_ERROR(
+            "set_run_resource_grant: could not build %zu run-resource sets; keeping the previous grant of %zu", granted,
+            granted_run_resource_sets_
+        );
+        return false;
+    }
+    return true;
 }
 
 uint64_t SimDeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
@@ -263,9 +349,16 @@ void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
     return arena.base();
 }
 
-std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn) {
+std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn, std::string name) {
     int dev_id = device_id_;
-    return std::thread([dev_id, fn = std::move(fn)]() {
+    return std::thread([dev_id, fn = std::move(fn), name = std::move(name)]() {
+#if defined(__linux__)
+        // Linux caps a thread name at 15 characters plus NUL and fails the call
+        // outright on a longer one, which would leave the thread unnamed.
+        if (!name.empty()) {
+            pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
+        }
+#endif
         pto_cpu_sim_bind_device(dev_id);
         fn();
         pto_cpu_sim_bind_device(-1);
@@ -366,23 +459,92 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
     worker_count_ = num_aicore;
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
 
-    // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
+    // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
+    // state read by the sim's per-core thread start and by the DFX collector.
+    runtime.set_core_type_rule(num_aicore, block_dim);
+
+    // The sim has no upload: its threads read this host object in place, so
+    // `workers[]` here is the live handshake region and this loop is its
+    // per-run initialization, not a staged copy.
     Handshake *workers = runtime.get_workers();
     for (int i = 0; i < num_aicore; i++) {
         workers[i].aicpu_ready = 0;
         workers[i].aicore_done = 0;
         workers[i].task = 0;
         workers[i].core_type = (i < block_dim) ? CoreType::AIC : CoreType::AIV;
+        // Cleared with the rest of the report so a run's own epoch is the only
+        // value that can ever satisfy its sweep.
+        workers[i].report_epoch = 0;
     }
     return 0;
 }
 
 void *SimDeviceRunnerBase::allocate_tensor(size_t bytes) { return mem_alloc_.alloc(bytes); }
 
+void *SimDeviceRunnerBase::allocate_caller_buffer(size_t bytes) {
+    void *ptr = allocate_tensor(bytes);
+    if (ptr == nullptr) return nullptr;
+    try {
+        caller_device_buffers_.record(ptr, bytes);
+    } catch (...) {
+        // Rolled back for the reason the onboard twin gives: the record is what makes the
+        // allocation the caller's, so without it there is nothing to hand back.
+        free_tensor(ptr);
+        LOG_ERROR("allocate_caller_buffer: could not record %zu bytes as a caller allocation; rolled it back", bytes);
+        return nullptr;
+    }
+    return ptr;
+}
+
+int SimDeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
+    if (dev_ptr == nullptr) return 0;
+    // Same one-step check-and-forget as the onboard runner; see its comment for why the two are
+    // one operation and why an unrecorded address passes through unchanged.
+    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr)) {
+        LOG_ERROR(
+            "free_caller_buffer: %p is still held by %zu borrowing run(s) and %zu retained "
+            "reference(s); the caller's release is refused rather than performed",
+            dev_ptr, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    free_tensor(dev_ptr);
+    return 0;
+}
+
+bool SimDeviceRunnerBase::borrow_caller_buffers(
+    uint64_t identity, const CallerDeviceBuffers::Span *spans, size_t count
+) {
+    return caller_device_buffers_.borrow(identity, spans, count);
+}
+
+void SimDeviceRunnerBase::release_caller_buffers(uint64_t identity, bool keep) {
+    caller_device_buffers_.release(identity, keep);
+}
+
 void SimDeviceRunnerBase::free_tensor(void *dev_ptr) {
     if (dev_ptr != nullptr) {
         mem_alloc_.free(dev_ptr);
     }
+}
+
+void *SimDeviceRunnerBase::acquire_child_memory_host_view(void *dev_ptr, size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) return nullptr;
+    void *alloc_base = nullptr;
+    size_t alloc_size = 0;
+    if (!mem_alloc_.owning_allocation(dev_ptr, &alloc_base, &alloc_size)) {
+        LOG_ERROR("acquire_child_memory_host_view: %p is not inside a tracked device allocation", dev_ptr);
+        return nullptr;
+    }
+    const auto *end = static_cast<const unsigned char *>(dev_ptr) + bytes;
+    if (end > static_cast<const unsigned char *>(alloc_base) + alloc_size) {
+        LOG_ERROR(
+            "acquire_child_memory_host_view: [%p, +%zu) overruns its allocation [%p, +%zu)", dev_ptr, bytes, alloc_base,
+            alloc_size
+        );
+        return nullptr;
+    }
+    return dev_ptr;
 }
 
 int SimDeviceRunnerBase::copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes) {
@@ -398,6 +560,21 @@ int SimDeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, s
 int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     std::memset(dev_ptr, value, bytes);
     return 0;
+}
+
+uint64_t SimDeviceRunnerBase::run_result_region_base(uint32_t pipeline_slot) {
+    if (pipeline_slot >= device_run_results_.size()) return 0;
+    return reinterpret_cast<uint64_t>(&device_run_results_[pipeline_slot]);
+}
+
+const uint8_t *
+SimDeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const {
+    if (bytes_out != nullptr) *bytes_out = 0;
+    if (pipeline_slot >= device_run_results_.size()) return nullptr;
+    const DeviceRunResultRegion &region = device_run_results_[pipeline_slot];
+    if (!device_run_result_published(region, run_epoch)) return nullptr;
+    if (bytes_out != nullptr) *bytes_out = region.payload_bytes;
+    return region.payload;
 }
 
 void SimDeviceRunnerBase::get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size) {
@@ -416,56 +593,89 @@ void SimDeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void 
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-int SimDeviceRunnerBase::acquire_graph_definition_block(
-    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+int SimDeviceRunnerBase::acquire_graph_staging(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out
 ) {
-    if (device_out == nullptr || staging_out == nullptr) return -1;
-    *device_out = nullptr;
+    if (staging_out == nullptr) return -1;
     *staging_out = nullptr;
-    if (pipeline_slot >= graph_definition_blocks_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+    if (pipeline_slot >= graph_definition_staging_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0) {
         return -1;
     }
-    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
-    if (block.aligned_addr == nullptr || block.capacity < bytes ||
-        reinterpret_cast<uintptr_t>(block.aligned_addr) % alignment != 0) {
-        const size_t allocation_bytes = bytes + alignment - 1;
-        void *allocation = mem_alloc_.alloc(allocation_bytes);
-        if (allocation == nullptr) return -1;
-        const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-        if (raw > UINTPTR_MAX - (alignment - 1)) {
-            mem_alloc_.free(allocation);
-            return -1;
-        }
-        void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-        if (device_memset(aligned_addr, 0, bytes) != 0) {
-            mem_alloc_.free(allocation);
-            return -1;
-        }
-        if (block.allocation != nullptr && mem_alloc_.free(block.allocation) != 0) {
-            mem_alloc_.free(allocation);
-            return -1;
-        }
-        block.allocation = allocation;
-        block.aligned_addr = aligned_addr;
-        block.capacity = bytes;
-    }
-    // Grow-only and never shrunk, so a steady-state bind assembles its objects
-    // in host memory it neither acquires nor returns.
-    if (block.staging.size() < bytes) block.staging.resize(bytes);
-    *device_out = block.aligned_addr;
-    *staging_out = block.staging.data();
+    // A byte vector's storage is aligned for every type with fundamental
+    // alignment, which is what a Definition section asks for.
+    if (alignment > alignof(std::max_align_t)) return -1;
+    std::vector<std::byte> &staging = graph_definition_staging_[pipeline_slot].bytes;
+    // Grow-only and content-preserving: the recorders' objects are already in
+    // this block's prefix at the offsets they claimed.
+    if (staging.size() < bytes) staging.resize(bytes);
+    *staging_out = staging.data();
+    return 0;
+}
+
+int SimDeviceRunnerBase::publish_graph_section(
+    uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
+) {
+    if (source_out != nullptr) *source_out = static_cast<uint32_t>(GraphSectionSource::None);
+    if (base_out != nullptr) *base_out = 0;
+    if (bytes == nullptr || length == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (pipeline_slot >= graph_definition_staging_.size()) return PTO_RUNTIME_ERR_INTERNAL;
+    if (length > UINT32_MAX) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    std::vector<std::byte> &snapshot = graph_definition_staging_[pipeline_slot].snapshot;
+    if (snapshot.size() < length) snapshot.resize(length);
+    std::memcpy(snapshot.data(), bytes, length);
+    if (source_out != nullptr) *source_out = static_cast<uint32_t>(GraphSectionSource::HostSnapshot);
+    if (base_out != nullptr) *base_out = reinterpret_cast<uint64_t>(snapshot.data());
     return 0;
 }
 
 void SimDeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size) {
     if (addr != nullptr) *addr = nullptr;
     if (size != nullptr) *size = 0;
-    if (pipeline_slot >= graph_definition_blocks_.size()) return;
-    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
-    if (block.staging.empty()) return;
-    if (addr != nullptr) *addr = block.staging.data();
-    if (size != nullptr) *size = block.staging.size();
+    if (pipeline_slot >= graph_definition_staging_.size()) return;
+    std::vector<std::byte> &staging = graph_definition_staging_[pipeline_slot].bytes;
+    if (staging.empty()) return;
+    if (addr != nullptr) *addr = staging.data();
+    if (size != nullptr) *size = staging.size();
+}
+
+int SimDeviceRunnerBase::acquire_scheduler_state_storage(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (device_out != nullptr) *device_out = nullptr;
+    if (host_out != nullptr) *host_out = nullptr;
+    if (pipeline_slot >= scheduler_state_storage_.size()) return -1;
+    if (!can_accept_run()) {
+        LOG_ERROR("scheduler-state storage: refusing slot %u on a runner that cannot accept a run", pipeline_slot);
+        return -1;
+    }
+    const RetainedSchedulerStorage::Status status = scheduler_state_storage_[pipeline_slot].acquire(
+        bytes, alignment,
+        [this](size_t raw_bytes) {
+            return mem_alloc_.alloc(raw_bytes);
+        },
+        [this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        },
+        device_out, host_out
+    );
+    if (status == RetainedSchedulerStorage::Status::Ok) return 0;
+    LOG_ERROR(
+        "scheduler-state storage: slot %u cannot serve %zu bytes (alignment %zu): status %u", pipeline_slot, bytes,
+        alignment, static_cast<uint32_t>(status)
+    );
+    return -1;
+}
+
+int SimDeviceRunnerBase::release_scheduler_state_storage() {
+    int first_error = 0;
+    for (RetainedSchedulerStorage &entry : scheduler_state_storage_) {
+        const int rc = entry.release([this](void *ptr) {
+            return mem_alloc_.free(ptr);
+        });
+        if (rc != 0 && first_error == 0) first_error = rc;
+    }
+    return first_error;
 }
 
 int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
@@ -496,17 +706,55 @@ int SimDeviceRunnerBase::acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes,
     return 0;
 }
 
+int SimDeviceRunnerBase::acquire_run_image_staging(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out
+) {
+    if (addr_out == nullptr) return -1;
+    *addr_out = nullptr;
+    if (pipeline_slot >= run_image_stagings_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+        return -1;
+    }
+    RetainedSmMirror &staging = run_image_stagings_[pipeline_slot];
+    // Grow-only, like the mirror: an image's size follows the graph a run builds,
+    // so a repeated workload writes host pages that are already mapped.
+    const size_t needed = bytes + alignment - 1;
+    if (staging.capacity < needed) {
+        // `new[]` default-initializes a trivially-typed array, so the block costs
+        // no page until the bind writes one. The outgoing block's bytes are not
+        // carried over: a publication ships what its own bind assembled.
+        std::unique_ptr<std::byte[]> storage(new (std::nothrow) std::byte[needed]);
+        if (storage == nullptr) return -1;
+        staging.storage = std::move(storage);
+        staging.capacity = needed;
+    }
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(staging.storage.get());
+    *addr_out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
+    return 0;
+}
+
+void SimDeviceRunnerBase::release_run_image_stagings() {
+    for (RetainedSmMirror &staging : run_image_stagings_) {
+        staging.storage.reset();
+        staging.capacity = 0;
+    }
+}
+
 void SimDeviceRunnerBase::release_sm_mirrors() {
+    for (auto &scratch : orchestration_scratch_)
+        scratch.reset();
     for (RetainedSmMirror &mirror : sm_mirrors_) {
         mirror.storage.reset();
         mirror.capacity = 0;
     }
 }
 
-void SimDeviceRunnerBase::release_graph_definition_blocks() {
-    for (RetainedGraphBlock &block : graph_definition_blocks_) {
-        if (block.allocation != nullptr) mem_alloc_.free(block.allocation);
-        block = RetainedGraphBlock{};
+void SimDeviceRunnerBase::release_graph_definition_staging() {
+    for (RetainedGraphStaging &staging : graph_definition_staging_) {
+        staging.bytes.clear();
+        staging.bytes.shrink_to_fit();
+        staging.snapshot.clear();
+        staging.snapshot.shrink_to_fit();
     }
 }
 
@@ -601,8 +849,7 @@ int SimDeviceRunnerBase::launch_device_register(int32_t callable_id) {
 
 int SimDeviceRunnerBase::record_device_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data, size_t orch_so_size,
-    const char *func_name, const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs,
-    std::vector<ArgDirection> signature
+    const char *func_name, const char *config_name, std::vector<ArgDirection> signature
 ) {
     // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
@@ -636,7 +883,6 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     state.dev_orch_so_size = orch_so_size;
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
-    state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     LOG_INFO(
@@ -648,7 +894,7 @@ int SimDeviceRunnerBase::record_device_orch_callable(
 
 int SimDeviceRunnerBase::record_host_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
-    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
@@ -673,7 +919,6 @@ int SimDeviceRunnerBase::record_host_orch_callable(
     state.chip_buffer_hash = chip_buffer_hash;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
-    state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
@@ -716,19 +961,30 @@ int SimDeviceRunnerBase::bind_callable_to_runtime(
     Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
     const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 ) {
+    // Clear before anything else, including before the registry lookup: an id
+    // that is gone is exactly the case where the reference still standing names
+    // a scratch `unregister_callable` already freed. So no bind — refused,
+    // failed, or successful — may leave a predecessor's.
+    runtime.clear_callable_tables();
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     const auto &state = it->second;
-    for (const auto &kv : state.kernel_addrs) {
-        if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
-            LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.replay_function_bin_addr(kv.first, kv.second);
+
+    auto block = chip_callable_buffers_.find(state.chip_buffer_hash);
+    if (block == chip_callable_buffers_.end()) {
+        LOG_ERROR("bind_callable_to_runtime: callable_id=%d has no retained registration block", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
+    // Sim holds the tables in host memory the registration built, so the
+    // reference is the same on both sides and nothing is copied per run.
+    const ChipCallableBuffer &tables = block->second;
+    runtime.set_callable_tables(
+        tables.object_table.empty() ? nullptr : tables.object_table.data(), tables.object_table_dev,
+        tables.entry_table_dev, tables.table_len
+    );
     // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
     // was already delivered at launch_device_register time.
     runtime.set_active_callable_id(callable_id);
@@ -756,92 +1012,481 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
-    set_dump_args_enabled(config.enable_dump_args);
-    set_pmu_enabled(config.enable_pmu);
-    // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
-    set_dep_gen_enabled(config.enable_dep_gen != 0);
-    set_scope_stats_enabled(config.enable_scope_stats != 0);
-    capture_clock_anchors_ = config.capture_clock_anchors != 0;
     set_output_prefix(config.output_prefix);
 }
 
-HostPhaseRecordPool *SimDeviceRunnerBase::host_phase_pool_arm(bool producer_wants_records) noexcept {
-    if (clock_correlation_provider_ != nullptr) {
-        clock_correlation_provider_->release(false);
-        clock_correlation_provider_.reset();
-    }
-    const bool swimlane_wants_records = chip_swimlane_level_ == ChipSwimlaneLevel::ORCH_PHASES;
-    const bool artifact_wants_records = producer_wants_records && !output_prefix_.empty();
-    chip_swimlane_collector_.set_host_orchestrated(swimlane_wants_records);
+void SimDeviceRunnerBase::begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    host_phase_runs_[pipeline_slot].begin(dfx);
+}
+
+HostPhaseRecordPool *
+SimDeviceRunnerBase::host_phase_pool_arm(uint32_t pipeline_slot, bool producer_wants_records) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return nullptr;
+    HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    run.host_orchestrated = run.chip_swimlane_level == ChipSwimlaneLevel::ORCH_PHASES;
     // arm() allocates the pool's buffers, so it can throw; this path is noexcept,
     // where an escaping exception is std::terminate. A pass that cannot get its
     // storage collects no records and says so by handing back nullptr.
     HostPhaseRecordPool *pool = nullptr;
     try {
-        pool = host_phase_records_.arm(artifact_wants_records || swimlane_wants_records);
+        pool = run.records.arm(run.wants_records(producer_wants_records));
     } catch (...) {
         LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
     }
-    if (!swimlane_wants_records) return pool;
+    if (!run.host_orchestrated) return pool;
 
-    begin_clock_correlation_session_if_needed();
     return pool;
 }
 
-void SimDeviceRunnerBase::begin_clock_correlation_session_if_needed() noexcept {
-    if (chip_swimlane_level_ != ChipSwimlaneLevel::ORCH_PHASES || chip_swimlane_collector_.clock_correlation_active()) {
-        return;
-    }
-    try {
-        clock_correlation_provider_ = simpler::dfx::make_clock_correlation_provider();
-        chip_swimlane_collector_.begin_clock_correlation_session(
-            clock_correlation_provider_->name(), clock_correlation_provider_->raw_device_timestamp_unit()
-        );
-        chip_swimlane_collector_.record_clock_anchor_samples(
-            simpler::dfx::capture_clock_anchor_group(
-                *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::HostOrchestrationBegin
-            )
-        );
-    } catch (...) {
-        clock_correlation_provider_.reset();
-        try {
-            chip_swimlane_collector_.begin_clock_correlation_session("unavailable", "unknown");
-        } catch (...) {
-            // begin() stores diagnostic strings and can still fail under
-            // allocation pressure. Keep this noexcept path fail-closed.
-            chip_swimlane_collector_.finish_clock_correlation_session();
-        }
-    }
+void SimDeviceRunnerBase::publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    const HostPhaseRunState &run = host_phase_runs_[pipeline_slot];
+    chip_swimlane_collector_.set_host_orchestrated(run.host_orchestrated);
 }
 
-void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane() {
-    if (!host_phase_records_.finished()) return;
+void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_slot) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    const simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
+    if (!records.finished()) return;
     chip_swimlane_collector_.set_host_phase_records(
-        host_phase_records_.submit_records(), host_phase_records_.device_upload_records(),
-        host_phase_records_.submitted_tasks(), host_phase_records_.total_records(),
-        host_phase_records_.dropped_records()
+        records.submit_records(), records.device_upload_records(), records.submitted_tasks(), records.total_records(),
+        records.dropped_records()
     );
 }
 
-void SimDeviceRunnerBase::finish_clock_correlation_session(bool capture_device_complete) noexcept {
-    if (!chip_swimlane_collector_.clock_correlation_active()) {
-        if (clock_correlation_provider_ != nullptr) clock_correlation_provider_->release(false);
-        clock_correlation_provider_.reset();
-        return;
+int SimDeviceRunnerBase::start_shared_collectors_for_run(
+    const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+) {
+    // Opening a resident collector's window drops the previous run's records and
+    // republishes the device level, so it belongs with the start, at launch.
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+    if (dfx.chip_swimlane_enabled()) {
+        // Same rule as the onboard base: configuration picks the path, and a
+        // run the retaining collector will not admit fails here rather than
+        // falling into the single-run reset, which would drop a predecessor's
+        // records. The reader shards start first because admission waits for
+        // their acknowledgement of the run table.
+        if (chip_swimlane_collector_.retains_runs()) {
+            chip_swimlane_collector_.start(thread_factory);
+            if (!chip_swimlane_collector_.run_begin(
+                    run_epoch, dfx.output_prefix, dfx.chip_swimlane_level, run_metadata.core_types,
+                    run_metadata.core_type_count, run_metadata.host_orchestrated, run_metadata.artifact_identity
+                )) {
+                LOG_ERROR(
+                    "ChipSwimlane: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            chip_swimlane_collector_.begin_run(dfx.output_prefix, dfx.chip_swimlane_level);
+            chip_swimlane_collector_.start(thread_factory);
+        }
     }
-    if (capture_device_complete && clock_correlation_provider_ != nullptr) {
+    if (dfx.dump_args_enabled()) {
+        // Configuration picks the path, as it does for swimlane and PMU: a run
+        // a retaining collector will not admit fails here, before any kernel is
+        // submitted, rather than falling into the single-run reset that would
+        // zero counters a predecessor's writer is still acknowledging against.
+        if (dump_collector_.retains_runs()) {
+            dump_collector_.start(thread_factory);
+            if (!dump_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.dump_args_level)) {
+                LOG_ERROR(
+                    "ArgsDump: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            dump_collector_.begin_run(dfx.output_prefix, dfx.dump_args_level);
+            dump_collector_.start(thread_factory);
+        }
+    }
+    if (dfx.pmu_enabled) {
+        // Configuration picks the path, exactly as it does for swimlane: a run
+        // a retaining collector will not admit fails here, before any kernel is
+        // submitted, rather than falling into the single-run reset that would
+        // drop a predecessor's rows.
+        if (pmu_collector_.retains_runs()) {
+            // Reader shards before admission, and only here: admitting a run
+            // waits for every shard to acknowledge the new epoch table, and a
+            // shard that has not been spawned cannot acknowledge anything.
+            pmu_collector_.start(thread_factory);
+            if (!pmu_collector_.run_begin(run_epoch, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type)) {
+                LOG_ERROR(
+                    "PmuCollector: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            // The default path keeps its order: the window is opened, then the
+            // threads that serve it start.
+            pmu_collector_.begin_run(make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type);
+            pmu_collector_.start(thread_factory);
+        }
+    }
+    if (dfx.scope_stats_enabled) {
+        // Configuration picks the path, as it does for the other retaining
+        // collectors: a run a retaining ScopeStats will not admit fails here,
+        // before any kernel is submitted. The refusal that matters is the
+        // quarantine one — `begin_run` would clear the very records a run
+        // whose completion could not be proved is still holding.
+        if (scope_stats_collector_.retains_runs()) {
+            scope_stats_collector_.start(thread_factory);
+            if (!scope_stats_collector_.run_begin(run_epoch, dfx.output_prefix)) {
+                LOG_ERROR(
+                    "ScopeStats: run %llu was not admitted for retained collection",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+        } else {
+            // The default path writes one file per boundary rather than a
+            // per-run artifact, and on failure it keeps the behaviour it has
+            // without the re-stamp: a run is never refused here. The helper has
+            // already logged which buffer and which run it concerns.
+            (void)scope_stats_collector_.begin_run(run_epoch);
+            scope_stats_collector_.start(thread_factory);
+        }
+    }
+    return 0;
+}
+
+// The terminal bank a run publishes into is the one its epoch acquired, not the
+// one its run-resource set is numbered. The banks are a fixed device resource
+// and the sets are as many as the grant allows, so the two counts need not agree
+// for either to be correct.
+
+uint64_t SimDeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch) {
+    // Zero means "publish no snapshot". Every path that cannot resolve a bank —
+    // swimlane off, collector not initialized, no free bank, no run identity —
+    // returns it rather than letting the device derive an address.
+    const int bank = chip_swimlane_collector_.acquire_run_terminal_bank(run_epoch);
+    if (bank < 0) return 0;
+    void *armed = chip_swimlane_collector_.arm_run_terminal_bank(static_cast<uint32_t>(bank), run_epoch);
+    if (armed == nullptr) {
+        // The acquire above took the bank and nothing was armed into it, so no
+        // producer can reach that address and the credit is proved free. Keeping
+        // it would retire one of the three banks per failed arm, and the run
+        // publishing no snapshot is already the reported outcome.
+        chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+        return 0;
+    }
+    return reinterpret_cast<uint64_t>(armed);
+}
+
+void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+    // Same rule as the onboard base: a launch that submitted nothing leaves an
+    // admitted, targetless slot that neither the writer nor a flush can see,
+    // and `kMaxOpenEpochs` of them exhaust the capacity the next admission
+    // waits on. Nothing may escape, for the reason the onboard base gives.
+    if (dfx.pmu_enabled && pmu_collector_.retains_runs()) {
+        // Nothing may escape a rollback path, for the reason given below.
         try {
-            chip_swimlane_collector_.record_clock_anchor_samples(
-                simpler::dfx::capture_clock_anchor_group(
-                    *clock_correlation_provider_, simpler::dfx::ClockAnchorPosition::DeviceExecutionComplete
-                )
-            );
+            (void)pmu_collector_.abandon_run(run_epoch);
         } catch (...) {}
     }
-    chip_swimlane_collector_.finish_clock_correlation_session();
-    if (clock_correlation_provider_ != nullptr) clock_correlation_provider_->release(false);
-    clock_correlation_provider_.reset();
+    if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
+        try {
+            (void)dump_collector_.abandon_run(run_epoch);
+        } catch (...) {}
+    }
+    if (dfx.scope_stats_enabled && scope_stats_collector_.retains_runs()) {
+        try {
+            scope_stats_collector_.abandon_run(run_epoch);
+        } catch (...) {}
+    }
+    // DepGen's admission lives on the arch runner, so it is given back through
+    // the hook. This sits with the other per-collector withdrawals and ahead of
+    // the swimlane gates below: those return early, and a run with dep_gen on
+    // and swimlane off would otherwise keep an export slot no writer and no
+    // flush can see — two of them exhaust admission for the runner's life.
+    if (dfx.dep_gen_enabled && dep_gen_retains_runs()) {
+        withdraw_dep_gen_run(run_epoch);
+    }
+    if (!dfx.chip_swimlane_enabled()) return;
+    try {
+        if (chip_swimlane_collector_.retains_runs()) {
+            (void)chip_swimlane_collector_.abandon_run(run_epoch);
+        } else {
+            // A terminal bank is taken per run whether or not this collector
+            // retains output, so its credit is owed back on the same terms.
+            // Retention decides only whether there is also a retained admission
+            // to withdraw; an ordinary-output run that stopped at NotStarted
+            // submitted nothing, so no producer can hold its bank and the
+            // release is proved rather than assumed.
+            chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+        }
+    } catch (...) {}
 }
+
+int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
+    // Both retaining collectors, inside the one call and the one budget: each
+    // is serviced with the time left rather than re-acquiring the caller's
+    // whole timeout, so the bound never doubles. Both are always attempted —
+    // the first one's failure must not hide the second's — and the call fails
+    // if either does, naming each.
+    //
+    // Deliberately not gated on `retains_runs()`: PMU keeps a sticky error
+    // record for the runner's whole life, so a failure recorded before a
+    // collector rebuild turned retention off must still be reported here.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    auto remaining_ms = [&deadline]() -> int {
+        const auto left =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (left <= 0) return 0;
+        return static_cast<int>(left);
+    };
+    std::string swimlane_error;
+    std::string pmu_error;
+    std::string dump_error;
+    std::string scope_stats_error;
+    std::string dep_gen_error;
+    std::string host_graph_error;
+    bool ok = true;
+    // Gated on whether this collector has ever retained, not on whether it
+    // retains now — the same boundary the onboard runner uses, and the same
+    // reason PMU's arm below is ungated. A failure recorded under retention has
+    // to survive the rebuild or reconfiguration that turned retention off, and
+    // a collector that never retained has nothing here its own runs did not
+    // already report.
+    if (chip_swimlane_collector_.ever_retained() &&
+        !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
+        ok = false;
+    }
+    if (!dump_collector_.flush_retained_runs(remaining_ms(), &dump_error)) {
+        ok = false;
+    }
+    if (!pmu_collector_.flush_retained_runs(remaining_ms(), &pmu_error)) {
+        ok = false;
+    }
+    // Deliberately not gated on `retains_runs()`, for the same reason PMU's arm
+    // is not: a sticky failure recorded before a collector rebuild reconfigured
+    // retention off must still be reported here. With retention never
+    // configured the call has nothing to wait for and nothing to report.
+    if (!scope_stats_collector_.flush_retained_runs(remaining_ms(), &scope_stats_error)) {
+        ok = false;
+    }
+    // DepGen lives on the arch runner, so it is reached through the hook. The
+    // arm is deliberately ungated, for the same reason PMU's is: a failure
+    // recorded before a collector rebuild reconfigured retention off must
+    // still be reported here, and a collector that retains nothing has
+    // nothing to wait for and nothing to report.
+    if (!dep_gen_flush_retained(remaining_ms(), &dep_gen_error)) {
+        ok = false;
+    }
+    // The host-built graph's own owner. Ungated for the same reason as the arms
+    // above: a failure recorded before retention was reconfigured off must still
+    // be reported, and an exporter holding nothing has nothing to wait for.
+    if (!host_graph_exporter_.flush_retained_runs(remaining_ms(), &host_graph_error)) {
+        ok = false;
+    }
+    if (ok) return 0;
+    if (error != nullptr) {
+        *error = swimlane_error;
+        for (const std::string &part : {dump_error, pmu_error, scope_stats_error, dep_gen_error, host_graph_error}) {
+            if (part.empty()) continue;
+            if (!error->empty()) *error += "; ";
+            *error += part;
+        }
+    }
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+void SimDeviceRunnerBase::finish_retained_runs() {
+    chip_swimlane_collector_.finish_retained_runs();
+    dump_collector_.finish_retained_runs();
+    pmu_collector_.finish_retained_runs();
+    scope_stats_collector_.finish_retained_runs();
+    dep_gen_finish_retained();
+    host_graph_exporter_.finish_retained_runs();
+}
+
+bool SimDeviceRunnerBase::seal_host_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+    if (!dfx.dep_gen_enabled || !host_graph_exporter_.retains_runs()) return true;
+    // The hand-off is passed in rather than called: this base names no runtime
+    // symbol, and the weak `take` a device-capturing runtime links reports that
+    // there is nothing here to publish.
+    return host_graph_exporter_.seal(run_epoch, dfx.output_prefix, &dep_gen_host_graph_take);
+}
+
+void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
+    if (pipeline_slot >= host_phase_runs_.size()) return;
+    simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
+    // Every phase this records is produced on the host during bind and the store
+    // is finished before launch, so it touches no device state and is callable
+    // from any point after bind — including a path that never launched. The run's
+    // output prefix is non-empty exactly when it produces diagnostic artifacts,
+    // and the store writes a pass at most once.
+    if (!output_prefix.empty() && records.finished()) {
+        (void)records.write_records_jsonl(make_host_phase_records_path(output_prefix));
+    }
+}
+
+void SimDeviceRunnerBase::close_pmu_run_boundary(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
+    if (!pmu_collector_.retains_runs()) {
+        pmu_collector_.quiesce();
+        pmu_collector_.reconcile_counters();
+        return;
+    }
+    // A retained run keeps only the run boundary's device-side reads — the
+    // per-core counters and the buffers the cores still hold — and hands the
+    // rest to the writer. No quiesce: the pipeline is shared with the
+    // successor, and draining it here is what the per-queue cut replaces.
+    //
+    // `device_execution_complete` is what the caller observed of this run's
+    // fence, and it is the whole of PMU's "this run finished" proof: the
+    // recovery path clears it, and a producer may then never have reached its
+    // own close.
+    (void)dfx;
+    pmu_collector_.run_close(run_epoch, device_execution_complete);
+}
+
+int SimDeviceRunnerBase::close_args_dump_run_boundary(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
+    if (!dump_collector_.retains_runs()) {
+        dump_collector_.quiesce();
+        dump_collector_.reconcile_counters();
+        dump_collector_.export_dump_files();
+        return 0;
+    }
+    // A retained run keeps only the run boundary's device-side reads — this
+    // run's terminal lane state and, for a lane whose handover its receipt
+    // ledger can decide, an unpublished buffer's records and payload — and
+    // hands the rest to the writer. No quiesce: the pipeline is shared with the
+    // successor, and draining it here is what the per-queue cut replaces.
+    (void)dfx;
+    // Non-zero when the close could not prove this run's published buffers were
+    // processed into host-owned storage inside its execution claim. That is an
+    // ownership failure, not a file annotation, so it travels out of here.
+    return dump_collector_.run_close(run_epoch, device_execution_complete);
+}
+
+void SimDeviceRunnerBase::close_scope_stats_run_boundary(
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+) {
+    if (!scope_stats_collector_.retains_runs()) {
+        scope_stats_collector_.quiesce();
+        scope_stats_collector_.reconcile_counters();
+        scope_stats_collector_.write_jsonl(dfx.output_prefix);
+        return;
+    }
+    // A retained run keeps the boundary's ownership steps — the receive drain
+    // and the terminal read — and hands only the rendering and the file write
+    // to the writer. `device_execution_complete` is what the caller observed of
+    // this run's fence and is the whole of this collector's completion proof:
+    // without it nothing shared is read and the run produces no artifact.
+    (void)dfx;
+    scope_stats_collector_.run_close(run_epoch, device_execution_complete);
+}
+
+int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
+    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
+    bool device_producers_stopped
+) {
+    // The order is fixed by two couplings, not by preference: the host phase
+    // records reach the collector before the swimlane export serializes them,
+    // and each collector drains before it reconciles before it exports.
+    // Diagnostic exports use the per-task output prefix the user set on
+    // CallConfig (CallConfig::validate() enforces non-empty upstream).
+    //
+    // Only ArgsDump's close reports anything here: a retained run whose
+    // published buffers it could not prove processed inside the execution claim
+    // is an ownership failure the caller has to see, because releasing the
+    // claim past one would let the successor reuse an arena whose bytes nobody
+    // copied. Every other collector's close is void, as it was.
+    int args_dump_rc = 0;
+    if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
+        // Both publications precede the epoch's metadata snapshot, which is
+        // what copies them. The extensions belong here for the same reason the
+        // host phase records do: a5's host_build_graph supplies a real
+        // publisher for them at every enabled level, and the collector holds
+        // one copy of the sections for every run it serves.
+        // No bank index is passed: a bank is held by the epoch that acquired it,
+        // so the close resolves its own and settles it there. See the onboard
+        // base for the two proofs that let one be handed on, and
+        // `device_producers_stopped` for the third, which only a simulated
+        // device can supply.
+        simpler::dfx::runs::close_run_boundary(
+            chip_swimlane_collector_, run_epoch, device_execution_complete, device_producers_stopped,
+            [this, pipeline_slot] {
+                publish_host_phase_records_to_swimlane(pipeline_slot);
+                publish_chip_swimlane_runtime_extensions();
+            }
+        );
+        write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
+        if (dfx.dump_args_enabled()) {
+            args_dump_rc = close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete);
+        }
+        if (dfx.pmu_enabled) {
+            close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
+        }
+        if (dfx.scope_stats_enabled) {
+            close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete);
+        }
+        return args_dump_rc;
+    }
+    if (dfx.chip_swimlane_enabled()) {
+        chip_swimlane_collector_.quiesce();
+        chip_swimlane_collector_.read_phase_header_metadata();
+        chip_swimlane_collector_.reconcile_counters();
+        // Only the completion path reads the bank; see the onboard base for why
+        // an incomplete run's snapshot says nothing about that run. Whether the
+        // bank itself comes back is a separate question, and on a simulated
+        // device it has an answer: the producers are this process's AICPU and
+        // AICore threads, and the drain joined every one of them before it got
+        // here.
+        const int bank = chip_swimlane_collector_.run_terminal_bank_of(run_epoch);
+        if (device_execution_complete) {
+            if (bank >= 0) {
+                chip_swimlane_collector_.report_run_terminal_snapshot(static_cast<uint32_t>(bank), run_epoch);
+                chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+            }
+        } else if (bank >= 0) {
+            if (device_producers_stopped) {
+                // Nothing reads what this run left there — `quiesce` above
+                // stopped the host's readers, and the entries carry their own
+                // epoch, so a survivor is counted as foreign by the next
+                // occupant rather than attributed to it.
+                chip_swimlane_collector_.discard_run_terminal_bank(run_epoch);
+            } else {
+                chip_swimlane_collector_.quarantine_run_terminal_bank(run_epoch);
+            }
+        }
+        publish_host_phase_records_to_swimlane(pipeline_slot);
+        publish_chip_swimlane_runtime_extensions();
+        chip_swimlane_collector_.export_swimlane_json();
+    }
+
+    write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
+
+    if (dfx.dump_args_enabled()) {
+        args_dump_rc = close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete);
+    }
+
+    if (dfx.pmu_enabled) {
+        close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
+    }
+
+    if (dfx.scope_stats_enabled) {
+        close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete);
+    }
+    return args_dump_rc;
+}
+
+// Whether this runtime's device scheduler dispatches from resolved kernel-entry
+// addresses rather than resolving each entry out of the CoreCallable object it
+// is handed. Defined by every runtime's runtime_maker.cpp, so adding a runtime
+// cannot leave the answer implicit, and true only where a device consumer reads
+// the entry view.
+extern "C" bool runtime_uses_callable_entry_table_impl();
 
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
     if (callable == nullptr) {
@@ -860,23 +1505,48 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
         return it->second.chip_dev;
     }
 
+    // Sized before anything is allocated, so an unaddressable func_id refuses
+    // the registration rather than leaving a scratch behind.
+    uint32_t table_len = 0;
+    int32_t bad_func_id = 0;
+    if (!chip_callable_table_length(callable, CHIP_MAX_FUNC_ID, &table_len, &bad_func_id)) {
+        LOG_ERROR("Chip callable declares func_id=%d outside [0, %d)", bad_func_id, CHIP_MAX_FUNC_ID);
+        return 0;
+    }
+    const bool want_entry_table = table_len != 0 && runtime_uses_callable_entry_table_impl();
+
+    // Every allocation this upload makes is taken before the scratch, so the
+    // only raw resource it owns is created with nothing fallible left between
+    // it and the guard that owns it. Filling these below allocates nothing.
+    std::vector<uint64_t> object_table(table_len, 0);
+    std::vector<uint64_t> entry_table;
+    if (want_entry_table) entry_table.assign(table_len, 0);
+    std::vector<void *> dlopen_handles;
+    dlopen_handles.reserve(callable->child_count());
+    bool published = false;
+
     // Allocate host scratch (host == device in sim). Plain new[] keeps
     // ChipCallableBuffer::host_scratch ownership symmetric with finalize().
     auto *scratch = new uint8_t[layout.total_size];
-    std::memcpy(scratch, callable, layout.total_size);
 
-    // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
-    // patch the child's resolved_addr_ to the function pointer. A scope guard
-    // owns scratch and any dlopen'd handles until the success path dismisses
-    // it; every early return unwinds cleanly.
-    std::vector<void *> dlopen_handles;
-    dlopen_handles.reserve(callable->child_count());
+    // The guard owns the scratch and every handle until the map entry does,
+    // and it takes that ownership on the statement after the allocation:
+    // `RAIIScopeGuard` stores the by-reference lambda in place, so nothing
+    // between the two can throw. It decides by `published` rather than by
+    // being dismissed, because the handles move into the published entry only
+    // after the insertion returns and a guard consulting a moved-from vector
+    // could not close them. Every early return and every throw before that
+    // point unwinds through here.
     auto cleanup = RAIIScopeGuard([&]() {
+        if (published) return;
         for (void *h : dlopen_handles)
             dlclose(h);
         delete[] scratch;
     });
+    std::memcpy(scratch, callable, layout.total_size);
 
+    // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
+    // patch the child's resolved_addr_ to the function pointer.
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
         auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + layout.header_size + off);
@@ -917,11 +1587,35 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
         child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(func));
     }
 
-    cleanup.dismiss();
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
-    chip_callable_buffers_.emplace(
-        layout.content_hash, ChipCallableBuffer{chip_dev, scratch, layout.total_size, 1, std::move(dlopen_handles)}
+
+    // The tables are filled from the same scratch the dlopen loop just patched,
+    // by the same helper the onboard path uses: sim's own host addresses stand
+    // in for the device base, so the object view addresses each CoreCallable
+    // inside the scratch and the entry view carries the host function pointer
+    // that child's resolved_addr_ now holds.
+    chip_callable_fill_tables(
+        callable, layout, scratch, chip_dev, table_len, object_table.data(),
+        want_entry_table ? entry_table.data() : nullptr
     );
+
+    // One publication point. The entry is built with no handles and inserted
+    // first: the insertion is the last thing that can fail, and until it
+    // returns the guard above is still the only owner of the scratch and the
+    // handles. The moves that follow are `std::vector`'s noexcept move
+    // assignment, so the entry cannot end up published and incomplete.
+    ChipCallableBuffer retained{chip_dev, scratch, layout.total_size, 1, {}};
+    retained.table_len = table_len;
+    if (table_len != 0) {
+        retained.object_table_dev = reinterpret_cast<uint64_t>(object_table.data());
+        if (want_entry_table) retained.entry_table_dev = reinterpret_cast<uint64_t>(entry_table.data());
+    }
+    auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
+    ChipCallableBuffer &owner = inserted.first->second;
+    owner.object_table = std::move(object_table);
+    owner.entry_table = std::move(entry_table);
+    owner.dlopen_handles = std::move(dlopen_handles);
+    published = true;
     LOG_DEBUG(
         "Uploaded chip callable (sim): chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev,
         layout.total_size, callable->child_count(), layout.content_hash

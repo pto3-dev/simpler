@@ -5,7 +5,7 @@ The top-level [README](../README.md) links only the handful of entry-point docs;
 this page is the complete map.
 
 These pages are also published as a searchable site at
-<https://hw-native-sys.github.io/simpler/>, which adds a generated API reference
+<https://www.pypto.ai/simpler/>, which adds a generated API reference
 for `simpler.worker`, `simpler.task_interface` and `simpler.orchestrator`. The
 site is built by `.github/workflows/docs.yml`; `mkdocs.yml` owns its navigation,
 so a new page needs a `nav` entry there as well as a row here.
@@ -52,6 +52,7 @@ changing simpler's own internals.
 | Document | What it covers |
 | -------- | -------------- |
 | [AICore Kernel Programming](aicore-kernel-programming.md) | Writing AICore kernels for this runtime |
+| [L2 Cache Bypass](l2-cache-bypass.md) | Native CANN ELF patching vs. simpler's args-based nocache-offset delivery |
 | [a5 AICore SIMT Launch](simt-launch.md) | a5 SIMT launch metadata and the `ChipCallable` alignment constraint |
 | [Manual Scope V0](manual-scope.md) | Explicit scope control from orchestration code |
 | [WAR Anti-Dependencies](war-anti-dependency.md) | Write-after-read hazards and how the runtime orders them |
@@ -73,7 +74,7 @@ changing simpler's own internals.
 | -------- | -------------- |
 | [Communication Domains](comm-domain.md) | Dynamic `CommDomain` allocation and the symmetric window |
 | [L3-L2 Orchestrator Communication](l3-l2-orch-comm.md) | Host-side L3 talking directly to the L2 AICPU orchestrator |
-| [L3-L2 Message Queue](l3-l2-message-queue.md) | The queue channel between an L3 host and L2 |
+| [L3-L2 Message Queue](l3-l2-message-queue.md) | The current SPSQ binding between an L3 host and one L2 task |
 | [Directed NEXT_LEVEL Scheduling](directed-next-level-scheduling.md) | Targeting a specific next-level child instead of any free one |
 | [Remote L3 Worker Design](remote-l3-worker-design.md) | L4 host-to-host workers — protocol, transports, status |
 | [remote-l3-worker-design/](remote-l3-worker-design/README.md) | Full design set: protocol, buffers and transports, implementation plan and record |

@@ -115,16 +115,18 @@ Worker::~Worker() {
     if (initialized_) close();
 }
 
-void Worker::add_worker(WorkerType type, void *mailbox, int child_pid, uint32_t task_frame_count) {
+void Worker::add_worker(WorkerType type, void *mailbox, size_t mailbox_bytes, int child_pid, uint32_t granted_sets) {
     if (initialized_) throw std::runtime_error("Worker: add_worker after init");
     if (type == WorkerType::NEXT_LEVEL) {
-        manager_.add_next_level(mailbox, child_pid, task_frame_count);
-    } else manager_.add_sub(mailbox, child_pid);
+        manager_.add_next_level(mailbox, mailbox_bytes, child_pid, granted_sets);
+    } else manager_.add_sub(mailbox, mailbox_bytes, child_pid);
 }
 
-void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) {
+void Worker::add_next_level_worker(
+    int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid, uint32_t granted_sets
+) {
     if (initialized_) throw std::runtime_error("Worker: add_next_level_worker after init");
-    manager_.add_next_level_at(worker_id, mailbox, child_pid, task_frame_count);
+    manager_.add_next_level_at(worker_id, mailbox, mailbox_bytes, child_pid, granted_sets);
 }
 
 void Worker::add_remote_l3_socket(
@@ -173,6 +175,10 @@ void Worker::init() {
         },
         [this](WorkerDispatch dispatch) {
             orchestrator_.mark_task_accepted(dispatch.task_slot);
+        },
+        [this](WorkerDispatch dispatch) {
+            TaskSlotState *slot = allocator_.slot_state(dispatch.task_slot);
+            if (slot != nullptr) orchestrator_.notify_run_staged(slot->run_id);
         }
     );
     ready_next_level_queues_.reset(manager_.next_level_worker_ids());
@@ -195,6 +201,18 @@ void Worker::init() {
     };
     cfg.preparable_run_cb = [this] {
         return orchestrator_.preparable_run_id();
+    };
+    cfg.preparable_runs_cb = [this] {
+        return orchestrator_.preparable_run_ids();
+    };
+    cfg.can_stage_run_on_worker_cb = [this](RunId run_id, int32_t worker_id) {
+        return orchestrator_.can_stage_run_on_worker(run_id, worker_id);
+    };
+    cfg.early_launch_run_cb = [this] {
+        return orchestrator_.early_launch_run_id();
+    };
+    cfg.early_launch_runs_cb = [this] {
+        return orchestrator_.early_launch_run_ids();
     };
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);

@@ -44,17 +44,11 @@
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
-// Periodic cadence (in idle iterations) for emitting the per-thread STALL
-// diagnostic while no progress is being made. Purely an observability knob,
-// independent of the wall-clock timeout below: small enough to fire a few times
-// before the budget expires, large enough not to flood device_log.
-constexpr int32_t STALL_LOG_INTERVAL = 480000;
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 
 // Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
 // the per-thread iteration-count cap that once lived here as MAX_IDLE_ITERATIONS
-// for the fatal-latch decision; STALL_LOG_INTERVAL above keeps the per-thread
-// diagnostic cadence.
+// for the fatal-latch decision.
 //
 // Using wall-clock here is load-bearing for distributed runs: with per-thread
 // iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
@@ -74,6 +68,8 @@ constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
+
+enum class StallDumpReport : int32_t { Periodic, Shutdown };
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 
