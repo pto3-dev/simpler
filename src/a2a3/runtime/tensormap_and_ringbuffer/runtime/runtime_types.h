@@ -510,6 +510,7 @@ enum TaskLifecycleFlag : uint8_t {
     // has_any_subtask_deferred().
     SUBTASK_DEFERRED = 1U << 2,
     DISPATCH_PROPAGATED = 1U << 3,
+    STATIC_BLOCK_MAPPING = 1U << 4,
 };
 
 static_assert((DISPATCH_PROPAGATED & (READY_CLAIMED | COMPLETION_DONE | SUBTASK_DEFERRED)) == 0);
@@ -562,6 +563,10 @@ struct alignas(64) ChipTaskSlotState {
     // can run concurrently after a partial staged release. All paths claim
     // ranges through claim_block_range().
     std::atomic<int16_t> next_block_idx{0};
+
+    bool static_block_mapping() const {
+        return (lifecycle_flags.load(std::memory_order_relaxed) & STATIC_BLOCK_MAPPING) != 0;
+    }
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
         int16_t current = next_block_idx.load(std::memory_order_relaxed);

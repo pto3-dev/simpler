@@ -197,6 +197,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // run publishes the reference and never the contents. Both are zero until a
     // bind names a callable; a func_id at or past the length is unmapped.
     uint64_t callable_table_addr_;
+    uint64_t callable_entry_table_addr_;
     uint32_t callable_table_len_;
 
     // Serial orchestrator -> scheduler start control.

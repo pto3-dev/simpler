@@ -559,6 +559,120 @@ void SchedulerContext::run_staging_order(
     }
 }
 
+void SchedulerContext::dispatch_static_tasks(
+    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+) {
+    const ResourceShape shapes[3] = {
+        ResourceShape::MIX, (thread_idx & 1) ? ResourceShape::AIV : ResourceShape::AIC,
+        (thread_idx & 1) ? ResourceShape::AIC : ResourceShape::AIV
+    };
+    for (ResourceShape shape : shapes) {
+        auto &cursor = shape == ResourceShape::MIX ? static_mix_cursors_[thread_idx] :
+                                                     (shape == ResourceShape::AIV ? static_aiv_cursors_[thread_idx] :
+                                                                                    static_cursors_[thread_idx]);
+        auto &queue = shape == ResourceShape::MIX ?
+                          sched_->static_mix_ready_queues[thread_idx] :
+                          (shape == ResourceShape::AIV ? sched_->static_aiv_ready_queues[thread_idx] :
+                                                         sched_->static_ready_queues[thread_idx]);
+        for (;;) {
+            if (cursor.task == nullptr) {
+                cursor.task = queue.pop_single_consumer();
+                if (cursor.task == nullptr) break;
+                cursor.remaining = {};
+                for (int32_t cluster = 0; cluster < tracker.get_cluster_count(); ++cluster) {
+                    int32_t first = shape == ResourceShape::AIV ? 1 : 0;
+                    int32_t last = shape == ResourceShape::AIV ? PLATFORM_CORES_PER_BLOCKDIM : 1;
+                    for (int32_t sub = first; sub < last; ++sub) {
+                        int32_t offset = cluster * PLATFORM_CORES_PER_BLOCKDIM + sub;
+                        if (SchedulerState::static_block_for_offset(shape, offset, thread_idx, active_sched_threads_) <
+                            cursor.task->logical_block_num)
+                            cursor.remaining |= CoreTracker::BitStates::bit(offset);
+                    }
+                }
+                ++static_tasks_[thread_idx];
+            }
+            ChipTaskSlotState &task = *cursor.task;
+            const bool early =
+                (shape == ResourceShape::MIX || shape == ResourceShape::AIC) &&
+                task.payload->early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_STAGING;
+            if (early) {
+                bool normal_ready = false;
+                for (int s = 0; s < NUM_RESOURCE_SHAPES; ++s)
+                    normal_ready |= sched_->ready_queues[s].size() > 0 || sched_->ready_sync_queues[s].size() > 0;
+                if (normal_ready) break;
+            }
+            PublishHandle handles[CoreTracker::MAX_CLUSTERS * PLATFORM_CORES_PER_BLOCKDIM];
+            int handle_count = 0;
+            int block_count = 0;
+            for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
+                if (pmu_active && phase == CoreTracker::DispatchPhase::PENDING) continue;
+                auto available = cursor.remaining;
+                if (shape != ResourceShape::MIX) available &= tracker.get_dispatchable_cores(shape, phase);
+                while (available.has_value()) {
+                    int32_t offset = available.pop_first();
+                    if (shape == ResourceShape::MIX) {
+                        auto wanted = phase == CoreTracker::DispatchPhase::IDLE ? CoreTracker::MixPlacement::RUNNING :
+                                                                                  CoreTracker::MixPlacement::PENDING;
+                        if (tracker.classify_mix_cluster(offset, task.active_mask.core_mask()) != wanted) continue;
+                    }
+                    int32_t block =
+                        SchedulerState::static_block_for_offset(shape, offset, thread_idx, active_sched_threads_);
+                    handle_count += prepare_block_for_dispatch(
+                        thread_idx, offset, task, shape, phase == CoreTracker::DispatchPhase::PENDING, block,
+                        &handles[handle_count], early
+                    );
+                    ++block_count;
+                    cursor.remaining.clear_bit(offset);
+                }
+            }
+            if (block_count == 0) break;
+            task.next_block_idx.fetch_add(static_cast<int16_t>(block_count), std::memory_order_seq_cst);
+            wmb();
+            uint64_t stamp = 0;
+#if SIMPLER_DFX
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) stamp = get_sys_cnt_aicpu();
+#endif
+            uint64_t my_cores[EARLY_DISPATCH_CORE_MASK_WORDS] = {};
+            for (int i = 0; i < handle_count; ++i) {
+                publish_subtask_to_core(handles[i], stamp, thread_idx);
+                if (early) {
+                    int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+                    sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+                    sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
+                    my_cores[cid >> 6] |= 1ULL << (cid & 63);
+                }
+            }
+            if (early) {
+                for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w)
+                    if (my_cores[w] != 0)
+                        task.payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
+                if (task.payload->early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_DISPATCHED) {
+                    uint64_t owned[EARLY_DISPATCH_CORE_MASK_WORDS] = {};
+                    for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; ++w)
+                        if (my_cores[w] != 0)
+                            owned[w] = SchedulerState::claim_late_staged_doorbell_bits(
+                                task.payload->staged_core_mask[w], my_cores[w]
+                            );
+                    for (int i = 0; i < handle_count; ++i) {
+                        int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+                        SchedulerState::ring_claimed_local_doorbell(
+                            owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
+                        );
+                    }
+                    wmb();
+                }
+            }
+            sched_->record_published_blocks(task, block_count);
+            sched_->propagate_dispatch_fanin(task);
+            static_blocks_[thread_idx] += block_count;
+            made_progress = true;
+            try_pushed = true;
+            if (cursor.remaining.has_value()) break;
+            cursor.task = nullptr;
+        }
+    }
+}
+
 void SchedulerContext::dispatch_ready_tasks(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
 ) {
@@ -583,6 +697,8 @@ void SchedulerContext::dispatch_ready_tasks(
         }
     );
     if (entered_drain) return;
+
+    dispatch_static_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 
     // Tier 1: regular ready work.
     run_staging_order(
@@ -813,6 +929,10 @@ int32_t SchedulerContext::try_early_dispatch(
     //     regular ready_queues) strictly precedes early — there is no real ready task
     //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
+    if (static_mix_cursors_[thread_idx].task != nullptr || static_cursors_[thread_idx].task != nullptr ||
+        static_aiv_cursors_[thread_idx].task != nullptr || sched_->static_mix_ready_queues[thread_idx].size() > 0 ||
+        sched_->static_ready_queues[thread_idx].size() > 0 || sched_->static_aiv_ready_queues[thread_idx].size() > 0)
+        return 0;
     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
@@ -904,6 +1024,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // completed count so the caller still sees the negative error rc while the
     // shared end-of-loop flush below runs.
     int32_t timeout_rc = 0;
+    static_cursors_[thread_idx] = {};
+    static_aiv_cursors_[thread_idx] = {};
+    static_mix_cursors_[thread_idx] = {};
+    static_blocks_[thread_idx] = 0;
+    static_tasks_[thread_idx] = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if SIMPLER_DFX
@@ -964,7 +1089,23 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++) {
                 // Total normal-source ready depth of shape `s` = regular ready lane + the
                 // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
-                const size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
+                size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
+                // Static queues contain one owner entry per participating scheduler.
+                // Include these entries in the AIC backlog; each cursor is sampled
+                // only by its owning thread to avoid unsynchronised peer reads.
+                if (s == static_cast<int>(ResourceShape::AIC)) {
+                    for (int32_t owner = 0; owner < sched_->static_sched_threads; ++owner)
+                        qsize += sched_->static_ready_queues[owner].size();
+                    qsize += static_cursors_[thread_idx].task != nullptr ? 1 : 0;
+                } else if (s == static_cast<int>(ResourceShape::MIX)) {
+                    for (int32_t owner = 0; owner < sched_->static_sched_threads; ++owner)
+                        qsize += sched_->static_mix_ready_queues[owner].size();
+                    qsize += static_mix_cursors_[thread_idx].task != nullptr ? 1 : 0;
+                } else if (s == static_cast<int>(ResourceShape::AIV)) {
+                    for (int32_t owner = 0; owner < sched_->static_sched_threads; ++owner)
+                        qsize += sched_->static_aiv_ready_queues[owner].size();
+                    qsize += static_aiv_cursors_[thread_idx].task != nullptr ? 1 : 0;
+                }
                 iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
             }
             iter_shared_sampled = true;
@@ -1551,5 +1692,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 #endif
 
+    LOG_INFO(
+        "Static mapping thread=%d tasks=%u blocks=%u", thread_idx, static_tasks_[thread_idx], static_blocks_[thread_idx]
+    );
     return timeout_rc != 0 ? timeout_rc : cur_thread_completed;
 }

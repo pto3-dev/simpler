@@ -786,6 +786,14 @@ static bool prepare_task(
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
+    ResourceShape static_shape = active_mask.to_shape();
+    int32_t static_limit = static_shape == ResourceShape::AIV ? orch->total_aiv_count : orch->total_cluster_count;
+    if (args.launch_spec.static_block_mapping() &&
+        (static_shape == ResourceShape::AIC || static_shape == ResourceShape::AIV ||
+         static_shape == ResourceShape::MIX) &&
+        !task_attrs.requires_sync_start() && !task_attrs.has_predicate() && block_num <= static_limit) {
+        out->slot_state->lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING, std::memory_order_relaxed);
+    }
     // fanin_count is set during Orch-side wiring
     scope_tasks_push(orch, out->slot_state);
 

@@ -261,10 +261,14 @@ public:
     int16_t core_num() const { return core_num_; }
     void set_core_num(int16_t n) { core_num_ = n; }
 
+    bool static_block_mapping() const { return static_block_mapping_; }
+    void set_static_block_mapping(bool value) { static_block_mapping_ = value; }
+
     bool require_sync_start() const { return require_sync_start_; }
     void set_require_sync_start(bool v) { require_sync_start_ = v; }
 
 private:
     int16_t core_num_{1};
     bool require_sync_start_{false};
+    bool static_block_mapping_{false};
 };
