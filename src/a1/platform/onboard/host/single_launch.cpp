@@ -401,6 +401,23 @@ public:
         context.Restore();
     }
 
+    void RebuildGraph(uint32_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        if (id == 0 || id > sequences_.size() || !sequences_[id - 1].model)
+            throw std::invalid_argument("resident graph id is not prepared");
+        ContextGuard context(context_);
+        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "drain graph before rebuild");
+        DrainRetiredModels();
+        retired_models_.reserve(1);
+        auto &sequence = sequences_[id - 1];
+        auto replacement = std::make_unique<DeviceModel>(sequence.calls);
+        retired_models_.push_back(std::move(sequence.model));
+        sequence.model = std::move(replacement);
+        DrainRetiredModels();
+        context.Restore();
+    }
+
     void Close() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!context_) {
@@ -414,6 +431,7 @@ public:
                 Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "drain stream before close");
             }
             allocations_.clear();
+            DrainRetiredModels();
             while (!sequences_.empty()) {
                 if (sequences_.back().model) sequences_.back().model->Close();
                 sequences_.pop_back();
@@ -509,6 +527,15 @@ private:
         aclrtStream stream_ = nullptr;
         bool bound_ = false;
     };
+
+    std::vector<std::unique_ptr<DeviceModel>> retired_models_;
+
+    void DrainRetiredModels() {
+        while (!retired_models_.empty()) {
+            retired_models_.back()->Close();
+            retired_models_.pop_back();
+        }
+    }
 
     struct PreparedSequence {
         DeviceAllocation descriptors;
@@ -689,5 +716,12 @@ extern "C" int simpler_a1_run_graph(void *session, uint32_t id) {
     return Invoke([&] {
         if (!session) throw std::invalid_argument("single launch session is closed");
         static_cast<SingleLaunch *>(session)->RunGraph(id);
+    });
+}
+
+extern "C" int simpler_a1_rebuild_graph(void *session, uint32_t id) {
+    return Invoke([&] {
+        if (!session) throw std::invalid_argument("single launch session is closed");
+        static_cast<SingleLaunch *>(session)->RebuildGraph(id);
     });
 }
