@@ -131,6 +131,8 @@ def _load_runtime() -> Any:
     library.simpler_a1_prepare_graph.restype = ctypes.c_int
     library.simpler_a1_run_graph.argtypes = library.simpler_a1_run_sequence.argtypes
     library.simpler_a1_run_graph.restype = ctypes.c_int
+    library.simpler_a1_rebuild_graph.argtypes = library.simpler_a1_run_sequence.argtypes
+    library.simpler_a1_rebuild_graph.restype = ctypes.c_int
     return library
 
 
@@ -411,6 +413,21 @@ class A1PreparedSequence:
         self._sequence_id = sequence_id
         self._tensors = tensors
         self._device_model = device_model
+
+    def rebuild(self) -> None:
+        """Recreate this device model with the current CANN profiling state.
+
+        Call after starting or stopping profiling, outside measured replays.
+        Tensor bindings and this graph handle remain unchanged. No arithmetic
+        kernel executes; the session drains before replacing model resources.
+        A failed old-model cleanup remains owned for retry or session close.
+        """
+        if not self._device_model:
+            raise ValueError("rebuild requires a prepared device model")
+        with self._owner._lock:
+            if not self._owner._handle.value:
+                raise RuntimeError("single launch session is closed")
+            self._owner._check(self._owner._library.simpler_a1_rebuild_graph(self._owner._handle, self._sequence_id))
 
     def __call__(self) -> None:
         with self._owner._lock:
