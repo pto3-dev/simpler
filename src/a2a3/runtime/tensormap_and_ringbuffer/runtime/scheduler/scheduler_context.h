@@ -138,6 +138,19 @@ private:
     // State
     // =========================================================================
 
+    struct StaticCursor {
+        ChipTaskSlotState *task{nullptr};
+        CoreTracker::BitStates remaining{};
+    };
+    StaticCursor static_cursors_[MAX_AICPU_THREADS];
+    StaticCursor static_aiv_cursors_[MAX_AICPU_THREADS];
+    StaticCursor static_mix_cursors_[MAX_AICPU_THREADS];
+    uint32_t static_blocks_[MAX_AICPU_THREADS]{};
+    uint32_t static_tasks_[MAX_AICPU_THREADS]{};
+    void dispatch_static_tasks(
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    );
+
     // --- Scheduler binding & per-core runtime state ---
     alignas(64) SchedulerState *sched_{nullptr};
     RuntimeContext *rt_{nullptr};

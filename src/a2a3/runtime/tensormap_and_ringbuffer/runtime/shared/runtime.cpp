@@ -45,6 +45,7 @@ Runtime::Runtime() {
     dev.entry_scalar_count_ = 0;
     dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::Descriptor);
     dev.callable_table_addr_ = 0;
+    dev.callable_entry_table_addr_ = 0;
     dev.callable_table_len_ = 0;
 }
 
@@ -109,6 +110,7 @@ void Runtime::set_callable_tables(
     callable_table_host_ = host_view;
     callable_entry_table_addr_ = entry_table_addr;
     dev.callable_table_addr_ = object_table_addr;
+    dev.callable_entry_table_addr_ = entry_table_addr;
     dev.callable_table_len_ = len;
 }
 
@@ -116,6 +118,7 @@ void Runtime::clear_callable_tables() {
     callable_table_host_ = nullptr;
     callable_entry_table_addr_ = 0;
     dev.callable_table_addr_ = 0;
+    dev.callable_entry_table_addr_ = 0;
     dev.callable_table_len_ = 0;
 }
 

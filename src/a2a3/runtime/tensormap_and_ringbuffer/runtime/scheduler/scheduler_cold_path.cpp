@@ -1088,6 +1088,9 @@ void SchedulerContext::assign_own_clusters(Runtime *runtime, int32_t tidx) {
                     dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
                 }
                 dp.global_context.l2_cache_offset = get_dev_l2_cache_offset();
+                dp.global_context.callable_entry_table = runtime->dev.callable_entry_table_addr_;
+                dp.global_context.callable_entry_count = runtime->dev.callable_table_len_;
+                dp.global_context.reserved = 0;
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
             }
@@ -1429,6 +1432,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
                 dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
             }
             dp.global_context.l2_cache_offset = get_dev_l2_cache_offset();
+            dp.global_context.callable_entry_table = runtime->dev.callable_entry_table_addr_;
+            dp.global_context.callable_entry_count = runtime->dev.callable_table_len_;
+            dp.global_context.reserved = 0;
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }
@@ -1494,6 +1500,12 @@ void SchedulerContext::deinit() {
     }
 
     regs_ = 0;
+    for (auto &cursor : static_cursors_)
+        cursor = {};
+    for (auto &cursor : static_aiv_cursors_)
+        cursor = {};
+    for (auto &cursor : static_mix_cursors_)
+        cursor = {};
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;
