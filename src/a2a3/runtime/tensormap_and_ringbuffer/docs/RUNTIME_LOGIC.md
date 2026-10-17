@@ -738,6 +738,8 @@ every used core has a free slot; `prepare_block_for_dispatch` then places **per 
 (`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
 skew within a block is tolerated by AICore incore synchronization.
 
+Fixed MIX maps block `b` to logical cluster `b` through owner-only MIX queues. Fixed AIC maps block `b` to AIC `b` through its owner-only AIC queues; both shapes preserve this mapping in speculative early dispatch. Each owner stages only its fixed blocks, once per cluster, using per-core running/pending placement. It does not enter sync_start drain or rendezvous. Fixed MIX and AIC early candidates enter their owner-only queues, never the global dynamic early queues. The AIC and MIX paths both handle gated staging, concurrent producer release, and once-only doorbell publication. Owners prepare gated payloads at fixed positions and publish the existing staged-core mask. Producer release and late staging use the same once-only doorbell ownership handshake as dynamic early dispatch. Partial release leaves unstaged blocks on fixed owner cursors rather than routing them dynamically. Other eligible tasks retain their existing early dispatch. A global join inside the region requires all awaited blocks to fit unique runtime clusters, independent prior work to make progress, and tensor lifetimes to cover the full region. Completion and GM dependency polling remain.
+
 ---
 
 ## 9. AICore Worker Interaction
