@@ -329,3 +329,52 @@ binding. It does not upload that write to the separate device binding. The calle
 keeps the backing alive through completion and explicitly waits/copies any prior
 device result before submitting a host consumer. TMR device orchestration rejects
 HOST/NONE. Neither path creates a cross-side mapped view.
+
+### Experimental fixed block placement (local A2A3 TMR candidate)
+
+`CoreTaskArgs.launch_spec.set_static_block_mapping(true)` is an advisory,
+per-task request. PyPTO emits it for pure AIC/AIV functions from
+`pl.func_attr({"static_block_mapping": True})`. The current mixed-kernel lowering
+does not carry this attribute into grouped MIX submissions; the model adapter
+sets the C++ LaunchSpec explicitly for the validated MLP sites. Unmarked tasks retain dynamic
+placement. Rebuild orchestration and runtime together when using this local API.
+
+Pure AIC, pure AIV and MIX tasks without predicates or `sync_start` are eligible
+when the grid fits the runtime cluster count or vector-core count respectively.
+AIC and MIX block `b` map to logical cluster `b`; AIV block `b` maps to logical vector
+core `b`. Each vector pair belongs to one cluster. The owning scheduler publishes to the
+target core's running/pending slot independently, without a group start barrier. Already early-dispatched
+pure AIC/AIV tasks keep their original placement. Fixed MIX tasks use the same owner queues for early staging and ready placement. Early staging gates each fixed core until its true predecessors release, without a cohort rendezvous; partial release retains fixed ownership for every remaining block. Unmarked communication, A5 and HBG use
+the dynamic path. This request does not remove completion polling or dependency
+tracking, and fixed placement can wait behind a busy target core.
+
+Level-3 scheduler timing remains available. AIC/AIV/MIX queue depths include per-owner
+static entries for that engine (one task may have several owner entries), plus the
+sampling thread's active cursor, so these depths are not unique-task counts.
+
+Owner-only queues use a single-consumer dequeue API without a consumer CAS.
+Producers retain sequence publication; global dynamic queues retain MPMC.
+This optimisation does not remove ACK/FIN polling or per-token DAG creation.
+
+## Static core programs (experimental, a2a3)
+
+`simpler_setup.static_program` expands synchronous generated PyPTO leaf sources into per-core execution sequences. `render_static_sequence(steps)` removes internal scheduler task boundaries. `plan_static_region(nodes)` validates a fork/join DAG; `render_static_region(nodes, lane, state_arg=..., epoch_arg=..., trace_arg=...)` emits a lane program. `StaticNode.dependency_scope` is `all_blocks` or `same_block`; same-lane, same-block edges use instruction order. The caller proves tile ownership, declares the union of tensor accesses, and keeps intermediates alive until region completion.
+
+Each region has one outer Simpler dispatch boundary. Pure AIC and MIX entry mapping can use `static_block_mapping`. Fixed MIX assigns each block to a unique cluster and launches each used core independently without drain or a group start barrier. The region runs on the existing persistent executor, with no per-instruction queue, payload, ACK or FIN. Cross-core readiness still polls explicit GM events; it is not a polling-free runtime.
+
+Event storage is INT64 `[node_count, runtime_grid, 16]`, initially zero, with one writer per 128-byte line. Epochs are positive and strictly increasing and state reuse follows completion of all region participants. Optional trace storage has the same shape; its first five fields are wait-entry, kernel-start, kernel-end, physical-core ID and epoch. The target runtime grid must come from actual available core counts. All lanes must be resident-capable; a region must not wait on work that its occupied cores prevent from launching.
+
+Leaf functions must drain all engines and expose no deferred completion or outside consumers. Their on-chip arenas are reused sequentially; contents do not survive a leaf boundary by contract. This source generator does not infer memory hazards, cross-leaf prefetch or arbitrary producer tile ranges. Generated hardware entries retain the ELF first-symbol validation. Region wait failure propagates through the existing asynchronous-error slab.
+
+The region lane sources additionally need the a2a3 onboard AICore platform header directory on their include path. CPU source-generation tests are in `tests/ut/py/test_static_program.py`. The caller must separately validate hardware residency and numerical results for each composed region.
+
+### Device-plan builder
+
+`simpler_setup.device_program.compile_device_program` validates synchronous leaf
+signatures, per-owner lane order and cross-lane dependencies before emitting a
+position-independent image. Its `Invocation` and `LeafSignature` declarations
+bind the root argument packet; image references are offsets or indices.
+`kernels/device_program` in the a2a3 TMR source tree provides matching AIC/AIV
+entries. Event lines require zero initialization and strictly increasing epochs.
+The caller owns union accesses, buffers, grid residency and replay serialization.
+CPU validation cases are in `tests/ut/py/test_device_program.py`.

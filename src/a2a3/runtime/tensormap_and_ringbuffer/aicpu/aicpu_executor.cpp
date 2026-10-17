@@ -778,6 +778,7 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
 
             // Wire scheduler context to the newly created RuntimeContext before
             // releasing scheduler threads from runtime_init_ready_.
+            rt->scheduler.static_sched_threads = sched_thread_num_ > 0 ? sched_thread_num_ : aicpu_thread_num_;
             sched_ctx_.bind_runtime(rt);
         }
 

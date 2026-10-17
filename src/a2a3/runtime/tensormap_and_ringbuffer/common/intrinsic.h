@@ -132,6 +132,10 @@ struct GlobalContext {
     // through it does not allocate in L2. 0 means the device exposes no alias, and
     // adding 0 leaves the load ordinary. Read via get_l2_cache_offset(args).
     uint64_t l2_cache_offset;
+    // Registration-owned executable entries; valid for the scheduler lifetime.
+    uint64_t callable_entry_table;
+    uint32_t callable_entry_count;
+    uint32_t reserved;
 };
 
 struct AsyncCtx {
