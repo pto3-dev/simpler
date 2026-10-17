@@ -127,6 +127,10 @@ def _load_runtime() -> Any:
     library.simpler_a1_prepare_sequence.restype = ctypes.c_int
     library.simpler_a1_run_sequence.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     library.simpler_a1_run_sequence.restype = ctypes.c_int
+    library.simpler_a1_prepare_graph.argtypes = library.simpler_a1_prepare_sequence.argtypes
+    library.simpler_a1_prepare_graph.restype = ctypes.c_int
+    library.simpler_a1_run_graph.argtypes = library.simpler_a1_run_sequence.argtypes
+    library.simpler_a1_run_graph.restype = ctypes.c_int
     return library
 
 
@@ -338,6 +342,20 @@ class A1SingleLaunch:
         Preparation uploads descriptors once. Invocation queues the whole sequence
         in stream order and synchronizes once, without allocation or activation copies.
         """
+        return self._prepare_calls(calls, device_model=False)
+
+    def prepare_graph(self, calls: list[tuple[int, int, tuple[A1DeviceTensor, ...]]]) -> "A1PreparedSequence":
+        """Prepare a static ordered device model with one model submission per replay.
+
+        The model retains immutable tensor bindings. Stream order establishes
+        dependencies, including in-place reads/writes. No kernel is executed
+        during preparation, and no per-task host launch occurs during replay.
+        """
+        return self._prepare_calls(calls, device_model=True)
+
+    def _prepare_calls(
+        self, calls: list[tuple[int, int, tuple[A1DeviceTensor, ...]]], *, device_model: bool
+    ) -> "A1PreparedSequence":
         if not 1 <= len(calls) <= 4096:
             raise ValueError("resident sequence requires 1..4096 calls")
         arguments = [self._device_arguments(tensors, kernel_id, blocks) for kernel_id, blocks, tensors in calls]
@@ -349,12 +367,13 @@ class A1SingleLaunch:
         with self._lock:
             if not self._handle.value:
                 raise RuntimeError("single launch session is closed")
-            self._check(
-                self._library.simpler_a1_prepare_sequence(
-                    self._handle, flat, counts, ids, blocks, len(calls), ctypes.byref(sequence_id)
-                )
+            prepare = (
+                self._library.simpler_a1_prepare_graph if device_model else self._library.simpler_a1_prepare_sequence
             )
-        return A1PreparedSequence(self, sequence_id.value, tuple(t for call in calls for t in call[2]))
+            self._check(prepare(self._handle, flat, counts, ids, blocks, len(calls), ctypes.byref(sequence_id)))
+        return A1PreparedSequence(
+            self, sequence_id.value, tuple(t for call in calls for t in call[2]), device_model=device_model
+        )
 
     def close(self) -> None:
         """Drain and release session resources; a failed drain remains retryable."""
@@ -380,13 +399,23 @@ class A1SingleLaunch:
 class A1PreparedSequence:
     """Immutable device bindings retained by one session; calls remain synchronous."""
 
-    def __init__(self, owner: A1SingleLaunch, sequence_id: int, tensors: tuple[A1DeviceTensor, ...]):
+    def __init__(
+        self,
+        owner: A1SingleLaunch,
+        sequence_id: int,
+        tensors: tuple[A1DeviceTensor, ...],
+        *,
+        device_model: bool = False,
+    ):
         self._owner = owner
         self._sequence_id = sequence_id
         self._tensors = tensors
+        self._device_model = device_model
 
     def __call__(self) -> None:
         with self._owner._lock:
             if not self._owner._handle.value:
                 raise RuntimeError("single launch session is closed")
-            self._owner._check(self._owner._library.simpler_a1_run_sequence(self._owner._handle, self._sequence_id))
+            library = self._owner._library
+            run = library.simpler_a1_run_graph if self._device_model else library.simpler_a1_run_sequence
+            self._owner._check(run(self._owner._handle, self._sequence_id))
