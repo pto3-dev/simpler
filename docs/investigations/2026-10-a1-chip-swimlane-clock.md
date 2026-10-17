@@ -1,7 +1,7 @@
 # A1 chip-swimlane clock and dispatch producer
 
 **Date**: 2026-10-17
-**Verdict**: deferred pending an A1 AICPU timestamp and dispatch producer
+**Verdict**: direct A2/A3 port rejected; AICPU-observed A1 protocol verified
 
 ## Question
 
@@ -56,3 +56,19 @@ receive/start/end timestamps. Port early-dispatch execution and phase
 instrumentation together, initially for two dependent tasks. Retain real HWTS
 and restored PMU comparisons in the meantime; native chip/early-dispatch
 collection remains incomplete.
+
+## Verified A1 observation transport
+
+A standalone common-loader AICPU entry now verifies `cntvct_el0` and the
+queried 38.4 MHz `cntfrq_el0` frequency on 310P3. ISB-ordered timestamp reads
+resolve zero-length/reordered observations from an unordered MRS probe.
+Separate 128-byte CPU-command and core-status lines with the native A1
+two-argument DCCI handshake pass five exact dependent Add-to-Mul rounds.
+The dynamic-layout producer also passes three complete YOLO26n 128x128
+rounds: 216 tasks, eight physical cores, 31 byte-identical output arrays.
+
+The supported diagnostic protocol is documented in
+`docs/dfx/a1-chip-swimlane.md`. It provides actual queue-stage and
+completion-observation records, with an explicit observation-envelope
+schema. The direct instruction-timestamp port remains invalid; the
+default static-model replay still has no AICPU dispatch producer.
