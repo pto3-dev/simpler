@@ -72,7 +72,7 @@ def test_foreign_tensors_and_invalid_launches_fail_before_dispatch():
 
 
 @pytest.mark.requires_hardware("a1")
-@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("prepared", [False, True, "graph"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_native_resident_multi_kernel_chain(tmp_path, dtype, prepared):
     try:
@@ -103,7 +103,8 @@ def test_native_resident_multi_kernel_chain(tmp_path, dtype, prepared):
         assert multiply == 1
         sequence = None
         if prepared:
-            sequence = runner.prepare_sequence([(0, 8, (a, b, out)), (multiply, 8, (out, b, out))])
+            prepare = runner.prepare_graph if prepared == "graph" else runner.prepare_sequence
+            sequence = prepare([(0, 8, (a, b, out)), (multiply, 8, (out, b, out))])
             with pytest.raises(RuntimeError, match="signature or kernel"):
                 runner.prepare_sequence([(99, 8, (a, b, out))])
         for seed in [223, 227]:
@@ -124,6 +125,12 @@ def test_native_resident_multi_kernel_chain(tmp_path, dtype, prepared):
             assert torch.equal(actual[:, 32:2080], expected)
             assert torch.equal(actual[:, :32], torch.full((1, 32), 7.0, dtype=dtype))
             assert torch.equal(actual[:, 2080:], torch.full((1, 32), 7.0, dtype=dtype))
+        if prepared == "graph":
+            for repeats in [16, 108]:
+                graph = runner.prepare_graph([(0, 8, (a, b, out)), (multiply, 8, (out, b, out))] * repeats)
+                for _ in range(2):
+                    graph()
+                    assert torch.equal(out.to_cpu(), expected)
         with pytest.raises(RuntimeError, match="registered"):
             runner.run_device(a, b, out, kernel_id=99)
         invalid = out._argument()

@@ -916,3 +916,14 @@ sequences, tensors and registered images. This is ordered stream submission,
 not hardware graph capture or an AICPU scheduler. Focused coverage is in
 `tests/ut/py/test_a1_device_tensor.py` (FP16/FP32 changing-input cross-image
 chains, output guards, ownership and closed-session rejection).
+
+### A1 prepared device models
+
+`A1SingleLaunch.prepare_graph(calls)` binds the same immutable resident arguments
+as `prepare_sequence`, but prepares a CANN device model. Replay makes one
+`rtModelExecute` call and a final stream wait; per-kernel launches occur only
+during preparation. Device stream order establishes dependencies. The session
+retains descriptors, tensors, registered images and the model until close.
+This static device-model backend does not implement A2/A3 AICPU orchestration.
+The focused `tests/ut/py/test_a1_device_tensor.py` graph cases check dependent
+FP16/FP32 kernels, changing inputs, in-place writes, guards and closed handles.

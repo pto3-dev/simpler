@@ -281,3 +281,14 @@ from that header plus the child's recorded offset and writes it into
 - **Runtime linking** via binary loading
 
 A1 sessions additionally provide `upload`, `empty`, `register_kernel` and `run_device` for synchronous multi-kernel execution with session-owned FP16/FP32 tensors. `A1DeviceTensor.view` creates bounded dense views; `copy_from` and `to_cpu` are explicit transfers. Kernels may use 1 through 8 blocks and registered images share the session context. Calls synchronize before returning; this is not graph capture or asynchronous scheduling. Cross-session tensor arguments and out-of-bounds/dtype-changing views are rejected. Closing the session drains its stream before releasing all tensors and images.
+
+### A1 prepared device models
+
+`A1SingleLaunch.prepare_graph(calls)` binds the same immutable resident arguments
+as `prepare_sequence`, but prepares a CANN device model. Replay makes one
+`rtModelExecute` call and a final stream wait; per-kernel launches occur only
+during preparation. Device stream order establishes dependencies. The session
+retains descriptors, tensors, registered images and the model until close.
+This static device-model backend does not implement A2/A3 AICPU orchestration.
+The focused `tests/ut/py/test_a1_device_tensor.py` graph cases check dependent
+FP16/FP32 kernels, changing inputs, in-place writes, guards and closed handles.
