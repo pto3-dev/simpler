@@ -89,14 +89,18 @@ from typing import Any, NamedTuple, NoReturn, cast
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     HOST_STRACE_ENABLED,
+    MAILBOX_OFF_WAKE_CAPABILITY,
+    MAILBOX_OFF_WAKE_SEQUENCE,
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
     _emit_host_span,
     _mailbox_load_i32,
     _mailbox_load_u64,
+    _mailbox_notify_work,
     _mailbox_store_i32,
     _mailbox_store_u64,
+    _mailbox_wait_i32,
     _read_control_copy_request,
     _region_vmm_granularity,
     _set_host_span_level_prefix,
@@ -2522,6 +2526,7 @@ def _request_child_shutdown(buf) -> None:
     """
     _mailbox_store_i32(_buffer_field_addr(buf, _OFF_SHUTDOWN), _SHUTDOWN_REQUESTED)
     _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
+    _mailbox_notify_work(_buffer_field_addr(buf, 0))
 
 
 def _write_error(buf, code: int, msg: str = "") -> None:
@@ -2585,6 +2590,21 @@ def _reexport_args_from_mailbox(buf, worker: Worker) -> TaskArgs:
 # orphan is reaped before it is noticeable, cheap enough to be lost in the
 # noise of the poll itself.
 _PARENT_LIVENESS_POLL_INTERVAL = 1000
+
+
+def _mailbox_wake_snapshot(buf) -> tuple[int, int] | None:
+    capability = _buffer_field_addr(buf, MAILBOX_OFF_WAKE_CAPABILITY)
+    if _mailbox_load_i32(capability) != 1:
+        return None
+    address = _buffer_field_addr(buf, MAILBOX_OFF_WAKE_SEQUENCE)
+    return address, _mailbox_load_i32(address)
+
+
+def _mailbox_park(snapshot: tuple[int, int] | None) -> None:
+    if snapshot is not None:
+        # Publishers change this generation and wake it for every frame.
+        # The timeout only bounds orphan detection, never arrival latency.
+        _mailbox_wait_i32(*snapshot, 0.1)
 
 
 def _run_mailbox_loop(
@@ -2685,6 +2705,7 @@ def _run_mailbox_loop(
 
     try:
         while True:
+            wake = _mailbox_wake_snapshot(buf) if liveness_countdown == 1 else None
             state = _mailbox_load_i32(state_addr)
             if state == _SHUTDOWN or _mailbox_load_i32(shutdown_addr) == _SHUTDOWN_REQUESTED:
                 if on_shutdown is not None:
@@ -2726,6 +2747,7 @@ def _run_mailbox_loop(
                         if on_shutdown is not None:
                             on_shutdown()
                         break
+                    _mailbox_park(wake)
     finally:
         for frame_buf in frame_bufs:
             frame_buf.release()
@@ -3979,6 +4001,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         shutdown_addr = _buffer_field_addr(buf, _OFF_SHUTDOWN)
         try:
             while True:
+                wake = _mailbox_wake_snapshot(buf) if not staged_runs and liveness_countdown == 1 else None
                 control_state = _mailbox_load_i32(state_addr)
                 if control_state == _SHUTDOWN or _mailbox_load_i32(shutdown_addr) == _SHUTDOWN_REQUESTED:
                     break
@@ -4093,6 +4116,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     if os.getppid() != parent_pid:
                         shutdown_message = f"chip_process dev={device_id}: parent exited"
                         break
+                    if not staged_runs:
+                        _mailbox_park(wake)
         finally:
             try:
                 cw._impl._close_chip_run_lane()

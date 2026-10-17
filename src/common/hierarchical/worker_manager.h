@@ -285,6 +285,12 @@ static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GENERATION = MAILBOX_OFF_ERROR_MSG 
 // matter what state word a concurrent control command leaves behind.
 static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ERROR_MSG - 80;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
+// Reserved trailer words form one wake generation for all task/control frames.
+// A publisher enables the contract; a legacy publisher leaves the capability zero.
+static constexpr ptrdiff_t MAILBOX_OFF_WAKE_SEQUENCE = MAILBOX_OFF_SHUTDOWN - 8;
+static constexpr ptrdiff_t MAILBOX_OFF_WAKE_CAPABILITY = MAILBOX_OFF_SHUTDOWN - 4;
+void mailbox_notify_work(void *mailbox) noexcept;
+
 // The chip child's teardown observation, published once on the control frame
 // after its device teardown returns. Reserved on every frame for the same
 // reason the shutdown word is: a task-args blob must not be able to reach it.
@@ -297,6 +303,9 @@ static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
 static constexpr ptrdiff_t MAILBOX_OFF_TEARDOWN_REPORT =
     MAILBOX_OFF_SHUTDOWN - static_cast<ptrdiff_t>(SIMPLER_TEARDOWN_REPORT_BYTES) - 8;
 static constexpr ptrdiff_t MAILBOX_OFF_TEARDOWN_REPORT_SCHEMA = MAILBOX_OFF_TEARDOWN_REPORT;
+static_assert(MAILBOX_OFF_TEARDOWN_REPORT + SIMPLER_TEARDOWN_REPORT_BYTES == MAILBOX_OFF_WAKE_SEQUENCE);
+static_assert(MAILBOX_OFF_WAKE_SEQUENCE % alignof(int32_t) == 0);
+
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
     MAILBOX_OFF_TASK_CALLABLE_HASH + static_cast<ptrdiff_t>(CALLABLE_HASH_DIGEST_SIZE);
