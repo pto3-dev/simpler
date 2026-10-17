@@ -58,3 +58,28 @@ diagnostic replay passes three rounds with all 31 saved arrays byte-equal
 to the strictly validated model replay. The diagnostic host wall time is
 8.02–8.41 ms and includes collection overhead; it is not a deployment
 latency claim. The default static CANN model backend remains unchanged.
+
+## Toolkit export
+
+```bash
+python -m simpler_setup.tools.a1_chip_swimlane capture.json \
+  --output observed-swimlane.json --report observed-critical-path.json
+```
+
+The JSON capture has `schema_version: 1`,
+`timestamp_kind: "aicpu_observed_envelopes"`, status, frequency, ordered
+`raw_core_ids`, task labels, `task_blocks`, and a `tasks` list. Each task has
+`dispatch_begin`, `dispatch_end`, `released`, and per-launched-core
+`received`/`finished` timestamp arrays. Absolute clock ticks remain integers;
+Perfetto export subtracts the captured epoch before converting units.
+The exporter rejects incomplete captures, duplicate cores, invalid clock
+metadata, and noncausal observations.
+
+Physical-core tracks show observed dependency waiting and release-to-finish
+intervals. Inactive blocks remain labeled as barrier observations. The
+AICPU track shows actual queue-publication phases; it does not claim
+core-side descriptor prefetch. The report calls the toolkit's critical-path
+algorithm with the observed sequential-barrier implementation and explicitly
+labels the resulting durations as instrumented envelopes. It does not treat
+this path as a compute-only lower bound, or combine it with another capture's
+CANN clock epoch. Existing A2/A3 tools retain their original schema.
