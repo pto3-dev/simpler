@@ -108,3 +108,5 @@ Newest first.
 - [2026-06 — a5 AICPU filter gate: Scenario B fail-fast guard not added](2026-06-a5-aicpu-filter-gate-scenario-b-validation.md)
 - [2026-06 — Sanitizer rollout scope: macOS, TSAN gating, LSan](2026-06-sanitizer-scope.md)
 - [2026-06 — chip swimlane: defer per-task wmb to rotation](2026-06-chip-swimlane-defer-wmb.md)
+
+- [2026-10 — A1 chip-swimlane clock and dispatch producer](2026-10-a1-chip-swimlane-clock.md) — direct SYS_CNT collection fails for dav-m200; AICPU control/timestamp producer required; model rebuild restores latched pipe counters.
