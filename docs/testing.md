@@ -901,3 +901,39 @@ This eliminates the need for separate `examples/` (sim) and `tests/st/` (device)
 ### When separate directories are still needed
 
 When kernels themselves differ (e.g., templated tile sizes tuned for device), separate test files remain the correct approach.
+
+### Ascend310P resident sequences
+
+`A1SingleLaunch.prepare_sequence(calls)` binds an ordered list of
+`(kernel_id, blocks, resident_tensors)` calls. Each tensor must belong to the
+session; each signature has 1..64 tensors and 1..8 coupled cores. Sequences
+contain 1..4096 calls. Preparation uploads descriptor/argument arrays once.
+The returned callable queues kernels on the session stream and synchronizes
+once at completion, without per-call allocations or descriptor uploads.
+Changing inputs uses the existing tensor `copy_from` method; resident pointers
+and views remain fixed. Session close drains the stream before releasing
+sequences, tensors and registered images. This is ordered stream submission,
+not hardware graph capture or an AICPU scheduler. Focused coverage is in
+`tests/ut/py/test_a1_device_tensor.py` (FP16/FP32 changing-input cross-image
+chains, output guards, ownership and closed-session rejection).
+
+### A1 prepared device models
+
+`A1SingleLaunch.prepare_graph(calls)` binds the same immutable resident arguments
+as `prepare_sequence`, but prepares a CANN device model. Replay makes one
+`rtModelExecute` call and a final stream wait; per-kernel launches occur only
+during preparation. Device stream order establishes dependencies. The session
+retains descriptors, tensors, registered images and the model until close.
+This static device-model backend does not implement A2/A3 AICPU orchestration.
+The focused `tests/ut/py/test_a1_device_tensor.py` graph cases check dependent
+FP16/FP32 kernels, changing inputs, in-place writes, guards and closed handles.
+
+For `aclprof` pipe counters, start profiling **before** model preparation, or
+call `graph.rebuild()` after `aclprofStart`. CANN 9.1 latches pipe-counter
+collection into the model's kernel tasks during preparation: a model prepared
+before profiling can report nonzero total cycles with zero pipe counters.
+Rebuild preserves the handle, resident tensors, descriptor addresses and task
+order; only the CANN model and its bound stream are replaced. It executes no
+arithmetic kernel. Keep rebuilding and warmup outside measured replay windows.
+After profiling stops, rebuild again if the same graph will be benchmarked
+without that profiling state. Host-loop prepared sequences cannot be rebuilt.
