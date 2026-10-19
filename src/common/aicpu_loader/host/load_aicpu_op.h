@@ -42,15 +42,14 @@
  * fingerprint-named preinstall files).
  */
 
-#ifndef COMMON_HOST_LOAD_AICPU_OP_H_
-#define COMMON_HOST_LOAD_AICPU_OP_H_
+#pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "common/kernel_args.h"
 #include "runtime/runtime/rts/rts_kernel.h"
 #include "runtime/rt.h"
 
@@ -167,5 +166,3 @@ constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
 }  // namespace KernelNames
 
 }  // namespace host
-
-#endif  // COMMON_HOST_LOAD_AICPU_OP_H_
