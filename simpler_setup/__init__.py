@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Scene test setup — compilation toolchain, test framework, and platform discovery."""
 
+from .a1_single_launch import A1DeviceTensor, A1SingleLaunch
 from .elf_parser import extract_text_section
 from .kernel_compiler import KernelCompiler
 from .platform_info import parse_platform
@@ -26,6 +27,8 @@ from .scene_test import (
 from .torch_interop import make_chip_tensor_arg, torch_dtype_to_datatype
 
 __all__ = [
+    "A1DeviceTensor",
+    "A1SingleLaunch",
     "CallableNamespace",
     "KernelCompiler",
     "RuntimeBuilder",
