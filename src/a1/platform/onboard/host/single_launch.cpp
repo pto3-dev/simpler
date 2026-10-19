@@ -11,6 +11,7 @@
 
 #include <acl/acl.h>
 #include <runtime/rt.h>
+#include <runtime/rt_model.h>
 
 #include <cstdint>
 #include <cstring>
@@ -308,6 +309,115 @@ public:
         context.Restore();
     }
 
+    uint32_t PrepareSequence(
+        const ResidentArg *args, const uint32_t *counts, const uint32_t *ids, const uint32_t *blocks, uint32_t count,
+        bool device_model = false
+    ) {
+        if (!args || !counts || !ids || !blocks || count == 0 || count > 4096)
+            throw std::invalid_argument("resident sequence requires 1..4096 calls");
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (counts[i] == 0 || counts[i] > 64 || blocks[i] == 0 || blocks[i] > 8 || ids[i] > extra_kernels_.size())
+                throw std::invalid_argument("invalid resident sequence signature or kernel id");
+            total += counts[i];
+        }
+        std::vector<KernelTensor> descriptors(total);
+        for (uint32_t i = 0; i < total; ++i) {
+            const auto &arg = args[i].tensor;
+            descriptors[i].init_external(
+                ResidentPointer(args[i]), arg.bytes, arg.shape, arg.rank, static_cast<DataType>(arg.dtype), 0, false,
+                AddressSpace::DEVICE
+            );
+        }
+        ContextGuard context(context_);
+        PreparedSequence sequence;
+        void *descriptor_pointer = nullptr, *slot_pointer = nullptr;
+        const uint64_t descriptor_bytes = total * sizeof(KernelTensor), slot_bytes = total * sizeof(uint64_t);
+        Check(
+            aclrtMalloc(&descriptor_pointer, descriptor_bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
+            "allocate sequence descriptors"
+        );
+        sequence.descriptors.reset(descriptor_pointer);
+        Check(aclrtMalloc(&slot_pointer, slot_bytes, ACL_MEM_MALLOC_NORMAL_ONLY), "allocate sequence slots");
+        sequence.slots.reset(slot_pointer);
+        Check(
+            aclrtMemcpy(
+                descriptor_pointer, descriptor_bytes, descriptors.data(), descriptor_bytes, ACL_MEMCPY_HOST_TO_DEVICE
+            ),
+            "upload sequence descriptors"
+        );
+        std::vector<uint64_t> slots(total);
+        for (uint32_t i = 0; i < total; ++i)
+            slots[i] = reinterpret_cast<uint64_t>(descriptor_pointer) + i * sizeof(KernelTensor);
+        Check(
+            aclrtMemcpy(slot_pointer, slot_bytes, slots.data(), slot_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
+            "upload sequence slots"
+        );
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            sequence.calls.push_back(
+                {reinterpret_cast<uint64_t>(slot_pointer) + offset * sizeof(uint64_t),
+                 ids[i] ? extra_kernels_[ids[i] - 1].handle : kernel_, blocks[i]}
+            );
+            offset += counts[i];
+        }
+        if (device_model) sequence.model = std::make_unique<DeviceModel>(sequence.calls);
+        sequences_.push_back(std::move(sequence));
+        context.Restore();
+        return sequences_.size();
+    }
+
+    void RunSequence(uint32_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        if (id == 0 || id > sequences_.size()) throw std::invalid_argument("resident sequence id is not prepared");
+        ContextGuard context(context_);
+        for (const auto &call : sequences_[id - 1].calls) {
+            uint64_t entry = call.slots;
+            rtArgsEx_t args{};
+            args.args = &entry;
+            args.argsSize = sizeof(entry);
+            rtTaskCfgInfo_t config{};
+            config.schemMode = RT_SCHEM_MODE_BATCH;
+            Check(
+                rtKernelLaunchWithHandleV2(call.kernel, 0, call.blocks, &args, nullptr, stream_, &config),
+                "launch sequence kernel"
+            );
+        }
+        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "synchronize sequence");
+        context.Restore();
+    }
+
+    void RunGraph(uint32_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        if (id == 0 || id > sequences_.size() || !sequences_[id - 1].model)
+            throw std::invalid_argument("resident graph id is not prepared");
+        ContextGuard context(context_);
+        sequences_[id - 1].model->Run(stream_);
+        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "synchronize graph");
+        context.Restore();
+    }
+
+    void RebuildGraph(uint32_t id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        if (id == 0 || id > sequences_.size() || !sequences_[id - 1].model)
+            throw std::invalid_argument("resident graph id is not prepared");
+        ContextGuard context(context_);
+        Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "drain graph before rebuild");
+        DrainRetiredModels();
+        retired_models_.reserve(1);
+        auto &sequence = sequences_[id - 1];
+        auto replacement = std::make_unique<DeviceModel>(sequence.calls);
+        retired_models_.push_back(std::move(sequence.model));
+        sequence.model = std::move(replacement);
+        DrainRetiredModels();
+        context.Restore();
+    }
+
     void Close() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!context_) {
@@ -321,6 +431,11 @@ public:
                 Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "drain stream before close");
             }
             allocations_.clear();
+            DrainRetiredModels();
+            while (!sequences_.empty()) {
+                if (sequences_.back().model) sequences_.back().model->Close();
+                sequences_.pop_back();
+            }
             resident_.clear();
             while (!extra_kernels_.empty()) {
                 Check(rtDevBinaryUnRegister(extra_kernels_.back().handle), "unregister resident kernel");
@@ -349,6 +464,86 @@ public:
     }
 
 private:
+    struct PreparedCall {
+        uint64_t slots;
+        void *kernel;
+        uint32_t blocks;
+    };
+    class DeviceModel {
+    public:
+        explicit DeviceModel(const std::vector<PreparedCall> &calls) {
+            try {
+                Check(aclrtCreateStream(&stream_), "create model stream");
+                Check(rtModelCreate(&model_, 0), "create device model");
+                Check(rtModelBindStream(model_, stream_, RT_MODEL_HEAD_STREAM), "bind model stream");
+                bound_ = true;
+                for (const auto &call : calls) {
+                    uint64_t entry = call.slots;
+                    rtArgsEx_t args{};
+                    args.args = &entry;
+                    args.argsSize = sizeof(entry);
+                    rtTaskCfgInfo_t config{};
+                    config.schemMode = RT_SCHEM_MODE_BATCH;
+                    Check(
+                        rtKernelLaunchWithHandleV2(call.kernel, 0, call.blocks, &args, nullptr, stream_, &config),
+                        "prepare graph kernel"
+                    );
+                }
+                Check(rtEndGraph(model_, stream_), "end device graph");
+                Check(rtModelLoadComplete(model_), "load device graph");
+            } catch (...) {
+                if (bound_) rtModelUnbindStream(model_, stream_);
+                if (model_) rtModelDestroy(model_);
+                if (stream_) aclrtDestroyStream(stream_);
+                throw;
+            }
+        }
+        ~DeviceModel() {
+            try {
+                Close();
+            } catch (...) {}
+        }
+        DeviceModel(const DeviceModel &) = delete;
+        DeviceModel &operator=(const DeviceModel &) = delete;
+
+        void Run(aclrtStream stream) { Check(rtModelExecute(model_, stream, 0), "execute device graph"); }
+        void Close() {
+            if (bound_) {
+                Check(rtModelUnbindStream(model_, stream_), "unbind model stream");
+                bound_ = false;
+            }
+            if (model_) {
+                Check(rtModelDestroy(model_), "destroy device model");
+                model_ = nullptr;
+            }
+            if (stream_) {
+                Check(aclrtDestroyStream(stream_), "destroy model stream");
+                stream_ = nullptr;
+            }
+        }
+
+    private:
+        rtModel_t model_ = nullptr;
+        aclrtStream stream_ = nullptr;
+        bool bound_ = false;
+    };
+
+    std::vector<std::unique_ptr<DeviceModel>> retired_models_;
+
+    void DrainRetiredModels() {
+        while (!retired_models_.empty()) {
+            retired_models_.back()->Close();
+            retired_models_.pop_back();
+        }
+    }
+
+    struct PreparedSequence {
+        DeviceAllocation descriptors;
+        DeviceAllocation slots;
+        std::vector<PreparedCall> calls;
+        std::unique_ptr<DeviceModel> model;
+    };
+    std::vector<PreparedSequence> sequences_;
     struct ResidentBuffer {
         DeviceAllocation allocation;
         uint64_t bytes;
@@ -489,5 +684,44 @@ simpler_a1_run_resident(void *session, const ResidentArg *args, uint32_t count, 
     return Invoke([&] {
         if (!session) throw std::invalid_argument("single launch session is closed");
         static_cast<SingleLaunch *>(session)->RunResident(args, count, kernel_id, blocks);
+    });
+}
+
+extern "C" int simpler_a1_prepare_sequence(
+    void *session, const ResidentArg *args, const uint32_t *counts, const uint32_t *ids, const uint32_t *blocks,
+    uint32_t count, uint32_t *result
+) {
+    return Invoke([&] {
+        if (!session || !result) throw std::invalid_argument("invalid resident sequence request");
+        *result = static_cast<SingleLaunch *>(session)->PrepareSequence(args, counts, ids, blocks, count);
+    });
+}
+extern "C" int simpler_a1_run_sequence(void *session, uint32_t id) {
+    return Invoke([&] {
+        if (!session) throw std::invalid_argument("single launch session is closed");
+        static_cast<SingleLaunch *>(session)->RunSequence(id);
+    });
+}
+
+extern "C" int simpler_a1_prepare_graph(
+    void *session, const ResidentArg *args, const uint32_t *counts, const uint32_t *ids, const uint32_t *blocks,
+    uint32_t count, uint32_t *result
+) {
+    return Invoke([&] {
+        if (!session || !result) throw std::invalid_argument("invalid resident graph request");
+        *result = static_cast<SingleLaunch *>(session)->PrepareSequence(args, counts, ids, blocks, count, true);
+    });
+}
+extern "C" int simpler_a1_run_graph(void *session, uint32_t id) {
+    return Invoke([&] {
+        if (!session) throw std::invalid_argument("single launch session is closed");
+        static_cast<SingleLaunch *>(session)->RunGraph(id);
+    });
+}
+
+extern "C" int simpler_a1_rebuild_graph(void *session, uint32_t id) {
+    return Invoke([&] {
+        if (!session) throw std::invalid_argument("single launch session is closed");
+        static_cast<SingleLaunch *>(session)->RebuildGraph(id);
     });
 }

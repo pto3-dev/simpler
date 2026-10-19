@@ -115,6 +115,24 @@ def _load_runtime() -> Any:
         ctypes.c_uint32,
     ]
     library.simpler_a1_run_resident.restype = ctypes.c_int
+    library.simpler_a1_prepare_sequence.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_ResidentArg),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    library.simpler_a1_prepare_sequence.restype = ctypes.c_int
+    library.simpler_a1_run_sequence.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    library.simpler_a1_run_sequence.restype = ctypes.c_int
+    library.simpler_a1_prepare_graph.argtypes = library.simpler_a1_prepare_sequence.argtypes
+    library.simpler_a1_prepare_graph.restype = ctypes.c_int
+    library.simpler_a1_run_graph.argtypes = library.simpler_a1_run_sequence.argtypes
+    library.simpler_a1_run_graph.restype = ctypes.c_int
+    library.simpler_a1_rebuild_graph.argtypes = library.simpler_a1_run_sequence.argtypes
+    library.simpler_a1_rebuild_graph.restype = ctypes.c_int
     return library
 
 
@@ -300,8 +318,7 @@ class A1SingleLaunch:
             self._check(self._library.simpler_a1_register(self._handle, image, len(kernel), ctypes.byref(kernel_id)))
             return kernel_id.value
 
-    def run_device(self, *tensors: A1DeviceTensor, kernel_id: int = 0, blocks: int = 1) -> None:
-        """Run synchronously on resident tensors without activation transfers."""
+    def _device_arguments(self, tensors: tuple[A1DeviceTensor, ...], kernel_id: int, blocks: int) -> Any:
         if not 1 <= len(tensors) <= 64 or any(
             not isinstance(t, A1DeviceTensor) or t._owner is not self for t in tensors
         ):
@@ -311,10 +328,54 @@ class A1SingleLaunch:
         if isinstance(blocks, bool) or not isinstance(blocks, int) or not 1 <= blocks <= 8:
             raise ValueError("A1 launch blocks must be in 1..8")
         args = (_ResidentArg * len(tensors))(*(t._argument() for t in tensors))
+        return args
+
+    def run_device(self, *tensors: A1DeviceTensor, kernel_id: int = 0, blocks: int = 1) -> None:
+        """Run synchronously on resident tensors without activation transfers."""
+        args = self._device_arguments(tensors, kernel_id, blocks)
         with self._lock:
             if not self._handle.value:
                 raise RuntimeError("single launch session is closed")
             self._check(self._library.simpler_a1_run_resident(self._handle, args, len(args), kernel_id, blocks))
+
+    def prepare_sequence(self, calls: list[tuple[int, int, tuple[A1DeviceTensor, ...]]]) -> "A1PreparedSequence":
+        """Bind 1..4096 ordered calls to stable resident tensors and registered images.
+
+        Preparation uploads descriptors once. Invocation queues the whole sequence
+        in stream order and synchronizes once, without allocation or activation copies.
+        """
+        return self._prepare_calls(calls, device_model=False)
+
+    def prepare_graph(self, calls: list[tuple[int, int, tuple[A1DeviceTensor, ...]]]) -> "A1PreparedSequence":
+        """Prepare a static ordered device model with one model submission per replay.
+
+        The model retains immutable tensor bindings. Stream order establishes
+        dependencies, including in-place reads/writes. No kernel is executed
+        during preparation, and no per-task host launch occurs during replay.
+        """
+        return self._prepare_calls(calls, device_model=True)
+
+    def _prepare_calls(
+        self, calls: list[tuple[int, int, tuple[A1DeviceTensor, ...]]], *, device_model: bool
+    ) -> "A1PreparedSequence":
+        if not 1 <= len(calls) <= 4096:
+            raise ValueError("resident sequence requires 1..4096 calls")
+        arguments = [self._device_arguments(tensors, kernel_id, blocks) for kernel_id, blocks, tensors in calls]
+        counts = (ctypes.c_uint32 * len(calls))(*(len(args) for args in arguments))
+        ids = (ctypes.c_uint32 * len(calls))(*(call[0] for call in calls))
+        blocks = (ctypes.c_uint32 * len(calls))(*(call[1] for call in calls))
+        flat = (_ResidentArg * sum(counts))(*(arg for args in arguments for arg in args))
+        sequence_id = ctypes.c_uint32()
+        with self._lock:
+            if not self._handle.value:
+                raise RuntimeError("single launch session is closed")
+            prepare = (
+                self._library.simpler_a1_prepare_graph if device_model else self._library.simpler_a1_prepare_sequence
+            )
+            self._check(prepare(self._handle, flat, counts, ids, blocks, len(calls), ctypes.byref(sequence_id)))
+        return A1PreparedSequence(
+            self, sequence_id.value, tuple(t for call in calls for t in call[2]), device_model=device_model
+        )
 
     def close(self) -> None:
         """Drain and release session resources; a failed drain remains retryable."""
@@ -335,3 +396,43 @@ class A1SingleLaunch:
                 self.close()
             except RuntimeError:
                 pass
+
+
+class A1PreparedSequence:
+    """Immutable device bindings retained by one session; calls remain synchronous."""
+
+    def __init__(
+        self,
+        owner: A1SingleLaunch,
+        sequence_id: int,
+        tensors: tuple[A1DeviceTensor, ...],
+        *,
+        device_model: bool = False,
+    ):
+        self._owner = owner
+        self._sequence_id = sequence_id
+        self._tensors = tensors
+        self._device_model = device_model
+
+    def rebuild(self) -> None:
+        """Recreate this device model with the current CANN profiling state.
+
+        Call after starting or stopping profiling, outside measured replays.
+        Tensor bindings and this graph handle remain unchanged. No arithmetic
+        kernel executes; the session drains before replacing model resources.
+        A failed old-model cleanup remains owned for retry or session close.
+        """
+        if not self._device_model:
+            raise ValueError("rebuild requires a prepared device model")
+        with self._owner._lock:
+            if not self._owner._handle.value:
+                raise RuntimeError("single launch session is closed")
+            self._owner._check(self._owner._library.simpler_a1_rebuild_graph(self._owner._handle, self._sequence_id))
+
+    def __call__(self) -> None:
+        with self._owner._lock:
+            if not self._owner._handle.value:
+                raise RuntimeError("single launch session is closed")
+            library = self._owner._library
+            run = library.simpler_a1_run_graph if self._device_model else library.simpler_a1_run_sequence
+            self._owner._check(run(self._owner._handle, self._sequence_id))

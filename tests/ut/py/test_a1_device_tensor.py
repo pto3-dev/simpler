@@ -52,6 +52,10 @@ def test_foreign_tensors_and_invalid_launches_fail_before_dispatch():
     other = A1DeviceTensor(foreign, 1, (1, 16), torch.float32, 64)
     with pytest.raises(ValueError, match="owned"):
         owner.run_device(other)
+    with pytest.raises(ValueError, match="owned"):
+        owner.prepare_sequence([(0, 1, (other,))])
+    with pytest.raises(ValueError, match="1..4096"):
+        owner.prepare_sequence([])
     for blocks in [0, 9, True]:
         with pytest.raises(ValueError, match="blocks"):
             owner.run_device(tensor, blocks=blocks)
@@ -68,8 +72,9 @@ def test_foreign_tensors_and_invalid_launches_fail_before_dispatch():
 
 
 @pytest.mark.requires_hardware("a1")
+@pytest.mark.parametrize("prepared", [False, True, "graph"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_native_resident_multi_kernel_chain(tmp_path, dtype):
+def test_native_resident_multi_kernel_chain(tmp_path, dtype, prepared):
     try:
         acl = ctypes.CDLL("libascendcl.so")
     except OSError:
@@ -96,6 +101,12 @@ def test_native_resident_multi_kernel_chain(tmp_path, dtype):
         out = storage.view((1, 2048), offset_elements=32)
         multiply = runner.register_kernel(mul)
         assert multiply == 1
+        sequence = None
+        if prepared:
+            prepare = runner.prepare_graph if prepared == "graph" else runner.prepare_sequence
+            sequence = prepare([(0, 8, (a, b, out)), (multiply, 8, (out, b, out))])
+            with pytest.raises(RuntimeError, match="signature or kernel"):
+                runner.prepare_sequence([(99, 8, (a, b, out))])
         for seed in [223, 227]:
             generator = torch.Generator().manual_seed(seed)
             x = (torch.randint(-8, 9, (1, 2048), generator=generator).float() / 16).to(dtype)
@@ -105,12 +116,21 @@ def test_native_resident_multi_kernel_chain(tmp_path, dtype):
             b.copy_from(y)
             x.zero_()
             y.zero_()
-            runner.run_device(a, b, out, blocks=8)
-            runner.run_device(out, b, out, kernel_id=multiply, blocks=8)
+            if sequence is None:
+                runner.run_device(a, b, out, blocks=8)
+                runner.run_device(out, b, out, kernel_id=multiply, blocks=8)
+            else:
+                sequence()
             actual = storage.to_cpu()
             assert torch.equal(actual[:, 32:2080], expected)
             assert torch.equal(actual[:, :32], torch.full((1, 32), 7.0, dtype=dtype))
             assert torch.equal(actual[:, 2080:], torch.full((1, 32), 7.0, dtype=dtype))
+        if prepared == "graph":
+            for repeats in [16, 108]:
+                graph = runner.prepare_graph([(0, 8, (a, b, out)), (multiply, 8, (out, b, out))] * repeats)
+                for _ in range(2):
+                    graph()
+                    assert torch.equal(out.to_cpu(), expected)
         with pytest.raises(RuntimeError, match="registered"):
             runner.run_device(a, b, out, kernel_id=99)
         invalid = out._argument()
@@ -126,3 +146,6 @@ def test_native_resident_multi_kernel_chain(tmp_path, dtype):
         assert torch.equal(out.to_cpu(), expected)
     with pytest.raises(RuntimeError, match="closed"):
         out.to_cpu()
+    if sequence is not None:
+        with pytest.raises(RuntimeError, match="closed"):
+            sequence()
