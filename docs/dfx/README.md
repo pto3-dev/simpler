@@ -49,3 +49,5 @@ Analysis CLIs that consume these outputs are documented in
 | -------- | -------------- |
 | [Log System](../logging.md) | Log levels and sinks — the host/device logging path, distinct from profiling collectors |
 | [troubleshooting/](../troubleshooting/README.md) | Device error codes and timeout defaults, for when a run fails rather than runs slowly |
+
+- [A1 native chip observation protocol](a1-chip-swimlane.md)
