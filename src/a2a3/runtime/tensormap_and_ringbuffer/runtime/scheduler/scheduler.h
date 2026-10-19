@@ -213,6 +213,18 @@ struct alignas(64) ChipReadyQueue {
 
     ChipTaskSlotState *pop() { return pop_tagged(nullptr); }
 
+    // Only an owner queue may use this API: exactly one consumer advances the
+    // read ticket; producers publish each entry through its sequence number.
+    ChipTaskSlotState *pop_single_consumer() {
+        uint64_t pos = dequeue_pos.load(std::memory_order_relaxed);
+        ChipReadyQueueSlot &slot = slots[pos & mask];
+        if (slot.sequence.load(std::memory_order_acquire) != static_cast<int64_t>(pos + 1)) return nullptr;
+        ChipTaskSlotState *result = slot.slot_state;
+        dequeue_pos.store(pos + 1, std::memory_order_relaxed);
+        slot.sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
+        return result;
+    }
+
     ChipTaskSlotState *pop_tagged(TaskId *task_id_snapshot) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
@@ -430,6 +442,9 @@ struct CompletionStats {
 struct SchedulerLayout {
     size_t off_ready_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_ready_sync_queue_slots[NUM_RESOURCE_SHAPES];
+    size_t off_static_ready_queue_slots[PLATFORM_MAX_AICPU_THREADS];
+    size_t off_static_aiv_ready_queue_slots[PLATFORM_MAX_AICPU_THREADS];
+    size_t off_static_mix_ready_queue_slots[PLATFORM_MAX_AICPU_THREADS];
     size_t off_dummy_ready_queue_slots;
     size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
     size_t off_early_sync_start_queue_slots;
@@ -527,6 +542,10 @@ struct SchedulerState {
 
     // Dependency-only tasks (active_mask is empty, shape == DUMMY). Drained by
     // the dispatch loop and completed inline -- never goes to AICore.
+    ChipReadyQueue static_ready_queues[PLATFORM_MAX_AICPU_THREADS];
+    ChipReadyQueue static_aiv_ready_queues[PLATFORM_MAX_AICPU_THREADS];
+    ChipReadyQueue static_mix_ready_queues[PLATFORM_MAX_AICPU_THREADS];
+    int32_t static_sched_threads{0};
     ChipReadyQueue dummy_ready_queue;
 
     alignas(64) AsyncWaitList async_wait_list;
@@ -546,6 +565,13 @@ struct SchedulerState {
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
     void push_ready_routed(ChipTaskSlotState *slot_state) {
+        // The orchestrator uses this path for zero-fanin / already-completed
+        // producers, bypassing route_ready_once. Marked tasks must still claim
+        // readiness and early-dispatch state before entering owner queues.
+        if (slot_state->static_block_mapping()) {
+            route_ready_once(*slot_state);
+            return;
+        }
         ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
@@ -928,6 +954,9 @@ struct SchedulerState {
         // wiring caller has no separate predicate filter, so the gate lives here.
         if (consumer.task_attrs.has_predicate()) return;
         ResourceShape shape = consumer.active_mask.to_shape();
+        const bool fixed_owner =
+            consumer.static_block_mapping() && (shape == ResourceShape::MIX || shape == ResourceShape::AIC);
+        if (fixed_owner && static_sched_threads <= 0) return;
         if (shape != ResourceShape::AIC && shape != ResourceShape::AIV && shape != ResourceShape::MIX) {
             return;
         }
@@ -936,6 +965,12 @@ struct SchedulerState {
         if (!consumer.payload->early_dispatch_state.compare_exchange_strong(
                 expected, EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
             )) {
+            return;
+        }
+
+        if (fixed_owner) {
+            // Each owner's entry covers its fixed blocks through producer release.
+            try_push_static_ready(consumer, true);
             return;
         }
 
@@ -1034,7 +1069,10 @@ struct SchedulerState {
         }
     };
 
-    inline bool try_early_dispatch_release(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+    inline bool try_early_dispatch_release(
+        ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr, bool *never_staged = nullptr
+    ) {
+        if (never_staged != nullptr) *never_staged = false;
         // A predicated task is evaluated at the ready point, never early-dispatched.
         if (slot_state.task_attrs.has_predicate()) return false;
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
@@ -1042,6 +1080,7 @@ struct SchedulerState {
         if (slot_state.payload->early_dispatch_state.compare_exchange_strong(
                 expect, EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
             )) {
+            if (never_staged != nullptr) *never_staged = true;
             return false;
         }
         // route_ready_once admits one caller, but keep the helper defensive: a
@@ -1089,9 +1128,39 @@ struct SchedulerState {
         }
         // No explicit removal from the cross-thread queue: a still-queued entry for
         // this consumer is now DISPATCHED and is dropped when a peer pops it.
-        // Fully pre-staged => skip the ready queue. Partially staged SPMD consumer =>
-        // fall through so the caller pushes C; dispatch resumes from next_block_idx.
+        // Dynamic partial consumers resume via the ready queue. Fixed AIC/MIX consumers
+        // retain their existing owner entries for all remaining blocks.
+        if (slot_state.static_block_mapping() && static_sched_threads > 0 &&
+            (slot_state.active_mask.to_shape() == ResourceShape::MIX ||
+             slot_state.active_mask.to_shape() == ResourceShape::AIC))
+            return true;
         return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
+    }
+
+    // Fixed AIC/MIX owner entries survive producer release and cover every unstaged block.
+    // Pure AIV tasks retain dynamic placement when already pre-staged.
+    static int32_t static_owner_count(ResourceShape shape, int32_t blocks, int32_t owners) {
+        int32_t clusters = shape == ResourceShape::AIV ? (blocks + 1) / 2 : blocks;
+        return std::min(owners, clusters);
+    }
+
+    static int32_t static_block_for_offset(ResourceShape shape, int32_t offset, int32_t owner, int32_t owners) {
+        int32_t cluster = (offset / PLATFORM_CORES_PER_BLOCKDIM) * owners + owner;
+        return shape == ResourceShape::AIV ? 2 * cluster + offset % PLATFORM_CORES_PER_BLOCKDIM - 1 : cluster;
+    }
+
+    bool try_push_static_ready(ChipTaskSlotState &slot_state, bool never_staged) {
+        if (!never_staged || !slot_state.static_block_mapping() || static_sched_threads <= 0) return false;
+        ResourceShape shape = slot_state.active_mask.to_shape();
+        int32_t count = static_owner_count(shape, slot_state.logical_block_num, static_sched_threads);
+        for (int32_t thread = 0; thread < count; ++thread) {
+            ChipReadyQueue &queue =
+                shape == ResourceShape::MIX ?
+                    static_mix_ready_queues[thread] :
+                    (shape == ResourceShape::AIV ? static_aiv_ready_queues[thread] : static_ready_queues[thread]);
+            while (!queue.push(&slot_state)) {}
+        }
+        return true;
     }
 
     bool route_ready_once(ChipTaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
@@ -1099,7 +1168,8 @@ struct SchedulerState {
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
-        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        bool never_staged = false;
+        bool early_handled = try_early_dispatch_release(slot_state, sink, &never_staged);
         if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
             if (early_handled || drain_owned) return true;
@@ -1107,6 +1177,7 @@ struct SchedulerState {
             return true;
         }
 
+        if (try_push_static_ready(slot_state, never_staged)) return true;
         ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {
@@ -1140,7 +1211,8 @@ struct SchedulerState {
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
-        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        bool never_staged = false;
+        bool early_handled = try_early_dispatch_release(slot_state, sink, &never_staged);
         if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
             if (early_handled || drain_owned) return true;
@@ -1148,6 +1220,7 @@ struct SchedulerState {
             return true;
         }
 
+        if (try_push_static_ready(slot_state, never_staged)) return true;
         ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == ResourceShape::DUMMY ||
             (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {

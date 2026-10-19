@@ -17,10 +17,12 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "utils/device_arena.h"
 #include "scheduler/scheduler_types.h"
@@ -635,4 +637,317 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixIgnoresUnavailableUnusedCore) {
 
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, false), 1);
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, true), 1);
+}
+
+TEST(StaticLaunchSpecTest, PreservesAbiAndDefaultsToDynamic) {
+    LaunchSpec launch;
+    EXPECT_EQ(sizeof(launch), 4u);
+    EXPECT_FALSE(launch.static_block_mapping());
+    launch.set_block_num(7);
+    launch.set_static_block_mapping(true);
+    auto copy = launch;
+    EXPECT_TRUE(copy.static_block_mapping());
+    EXPECT_EQ(copy.block_num(), 7);
+    EXPECT_FALSE(copy.require_sync_start());
+}
+
+TEST_F(SchedulerStateTest, StaticReadyIsRoutedExactlyOnceToEachOwner) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.logical_block_num = 7;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    EXPECT_TRUE(sched.route_ready_once(slot));
+    EXPECT_FALSE(sched.route_ready_once(slot));
+    for (int thread = 0; thread < 3; ++thread) {
+        EXPECT_EQ(sched.static_ready_queues[thread].pop(), &slot);
+        EXPECT_EQ(sched.static_ready_queues[thread].pop(), nullptr);
+    }
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIC)].pop(), nullptr);
+    EXPECT_EQ(slot.payload->early_dispatch_state.load(), EARLY_DISPATCH_DISPATCHED);
+}
+
+TEST_F(SchedulerStateTest, StaticSmallGridSkipsOwnersWithoutBlocks) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.logical_block_num = 2;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    ASSERT_TRUE(sched.route_ready_once(slot));
+    EXPECT_EQ(sched.static_ready_queues[0].pop(), &slot);
+    EXPECT_EQ(sched.static_ready_queues[1].pop(), &slot);
+    EXPECT_EQ(sched.static_ready_queues[2].pop(), nullptr);
+}
+
+TEST_F(SchedulerStateTest, UnmarkedTasksKeepDynamicReadyQueue) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    sched.static_sched_threads = 3;
+    ASSERT_TRUE(sched.route_ready_once(slot));
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIC)].pop(), &slot);
+    for (auto &queue : sched.static_ready_queues)
+        EXPECT_EQ(queue.pop(), nullptr);
+}
+
+TEST_F(SchedulerStateTest, PartiallyEarlyStagedAivTasksKeepDynamicRemainder) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    slot.logical_block_num = 7;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    slot.next_block_idx.store(1);
+    slot.payload->early_dispatch_state.store(EARLY_DISPATCH_STAGING);
+    sched.static_sched_threads = 3;
+    ASSERT_TRUE(sched.route_ready_once(slot));
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIV)].pop(), &slot);
+    for (auto &queue : sched.static_ready_queues)
+        EXPECT_EQ(queue.pop(), nullptr);
+}
+
+TEST_F(SchedulerStateTest, StaticRequestDoesNotBypassFailedPredicate) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.task_attrs.set_predicate();
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    // The ready helper never considers a predicated task untouched/unstaged.
+    bool never_staged = true;
+    EXPECT_FALSE(sched.try_early_dispatch_release(slot, nullptr, &never_staged));
+    EXPECT_FALSE(never_staged);
+    EXPECT_FALSE(sched.try_push_static_ready(slot, never_staged));
+}
+
+TEST_F(SchedulerStateTest, StaticReadyPublicationAfterConcurrentFaninOccursOnce) {
+    ChipTaskSlotState slot;
+    constexpr int producers = 8;
+    init_slot(slot, CHIP_TASK_PENDING, producers, 0);
+    slot.logical_block_num = 7;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < producers; ++i)
+        threads.emplace_back([&] {
+            sched.release_fanin_and_check_ready(slot);
+        });
+    for (auto &thread : threads)
+        thread.join();
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(sched.static_ready_queues[i].pop(), &slot);
+        EXPECT_EQ(sched.static_ready_queues[i].pop(), nullptr);
+    }
+    EXPECT_EQ(slot.fanin_refcount.load(), producers);
+}
+
+TEST_F(SchedulerStateTest, StaticZeroFaninSubmitUsesOwnerQueues) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.logical_block_num = 7;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    sched.push_ready_routed(&slot);
+    for (int owner = 0; owner < 3; ++owner)
+        EXPECT_EQ(sched.static_ready_queues[owner].pop(), &slot);
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIC)].pop(), nullptr);
+    EXPECT_EQ(slot.payload->early_dispatch_state.load(), EARLY_DISPATCH_DISPATCHED);
+}
+
+TEST_F(SchedulerStateTest, OwnerQueueSingleConsumerWrapsAndPreservesOrder) {
+    auto &queue = sched.static_ready_queues[0];
+    ChipTaskSlotState slot;
+    ASSERT_EQ(queue.pop_single_consumer(), nullptr);
+    for (uint64_t i = 0; i < 2 * queue.capacity + 7; ++i) {
+        ASSERT_TRUE(queue.push(&slot));
+        ASSERT_EQ(queue.pop_single_consumer(), &slot);
+        ASSERT_EQ(queue.pop_single_consumer(), nullptr);
+    }
+}
+
+TEST_F(SchedulerStateTest, OwnerQueueSingleConsumerReceivesConcurrentProducersExactlyOnce) {
+    constexpr int producers = 8;
+    constexpr int per_producer = 256;
+    constexpr int total = producers * per_producer;
+    auto slots = std::make_unique<ChipTaskSlotState[]>(total);
+    auto &queue = sched.static_ready_queues[0];
+    std::vector<std::thread> threads;
+    for (int producer = 0; producer < producers; ++producer) {
+        threads.emplace_back([&, producer] {
+            for (int i = 0; i < per_producer; ++i)
+                while (!queue.push(&slots[producer * per_producer + i])) {}
+        });
+    }
+    std::vector<bool> seen(total, false);
+    int received = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (received < total && std::chrono::steady_clock::now() < deadline) {
+        if (auto *slot = queue.pop_single_consumer()) {
+            auto index = slot - slots.get();
+            EXPECT_GE(index, 0);
+            EXPECT_LT(index, total);
+            if (index < 0 || index >= total) break;
+            EXPECT_FALSE(seen[index]);
+            seen[index] = true;
+            ++received;
+        }
+    }
+    for (auto &thread : threads)
+        thread.join();
+    EXPECT_EQ(received, total);
+}
+
+TEST_F(SchedulerStateTest, StaticAivGridRoutesToOwnersOfVectorPairs) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    slot.logical_block_num = 3;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    sched.push_ready_routed(&slot);
+    EXPECT_EQ(sched.static_aiv_ready_queues[0].pop_single_consumer(), &slot);
+    EXPECT_EQ(sched.static_aiv_ready_queues[1].pop_single_consumer(), &slot);
+    EXPECT_EQ(sched.static_aiv_ready_queues[2].pop_single_consumer(), nullptr);
+    for (auto &queue : sched.static_ready_queues)
+        EXPECT_EQ(queue.pop(), nullptr);
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIV)].pop(), nullptr);
+}
+
+TEST(StaticPlacementGeometryTest, EachLogicalAicAndAivBlockHasOneOwner) {
+    for (int owners = 1; owners <= PLATFORM_MAX_AICPU_THREADS; ++owners) {
+        for (int clusters : {1, 5, 20}) {
+            for (ResourceShape shape : {ResourceShape::AIC, ResourceShape::AIV, ResourceShape::MIX}) {
+                int blocks = clusters * (shape == ResourceShape::AIV ? 2 : 1);
+                std::vector<int> seen(blocks, 0);
+                for (int owner = 0; owner < owners; ++owner) {
+                    for (int local = 0; local * owners + owner < clusters; ++local) {
+                        int begin = shape == ResourceShape::AIV ? 1 : 0;
+                        int end = shape == ResourceShape::AIV ? PLATFORM_CORES_PER_BLOCKDIM : 1;
+                        for (int sub = begin; sub < end; ++sub) {
+                            int offset = local * PLATFORM_CORES_PER_BLOCKDIM + sub;
+                            int block = SchedulerState::static_block_for_offset(shape, offset, owner, owners);
+                            ASSERT_GE(block, 0);
+                            ASSERT_LT(block, blocks);
+                            ++seen[block];
+                            EXPECT_LT(owner, SchedulerState::static_owner_count(shape, blocks, owners));
+                        }
+                    }
+                }
+                for (int count : seen)
+                    EXPECT_EQ(count, 1);
+            }
+        }
+    }
+}
+
+TEST_F(SchedulerStateTest, StaticMixRoutesExactlyOnceWithoutSyncDrain) {
+    ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.active_mask = ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1);
+    slot.logical_block_num = 7;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    sched.push_ready_routed(&slot);
+    EXPECT_FALSE(sched.route_ready_once(slot));
+    for (int owner = 0; owner < 3; ++owner) {
+        EXPECT_EQ(sched.static_mix_ready_queues[owner].pop_single_consumer(), &slot);
+        EXPECT_EQ(sched.static_mix_ready_queues[owner].pop_single_consumer(), nullptr);
+        EXPECT_EQ(sched.static_ready_queues[owner].pop(), nullptr);
+    }
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::MIX)].pop(), nullptr);
+    EXPECT_EQ(sched.ready_sync_queues[static_cast<int>(ResourceShape::MIX)].pop(), nullptr);
+    EXPECT_FALSE(slot.task_attrs.requires_sync_start());
+}
+
+TEST_F(SchedulerStateTest, StaticMixEarlyPlacementKeepsFixedOwnersAcrossRelease) {
+    ChipTaskSlotState slot;
+    TaskDescriptor descriptor{};
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.active_mask = ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1);
+    slot.logical_block_num = 7;
+    slot.task = &descriptor;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    sched.try_enqueue_early_dispatch_candidate(slot);
+    EXPECT_EQ(slot.payload->early_dispatch_state.load(), EARLY_DISPATCH_STAGING);
+    EXPECT_EQ(sched.early_dispatch_queues[static_cast<int>(ResourceShape::MIX)].size(), 0u);
+    slot.next_block_idx.store(1);
+    EXPECT_TRUE(sched.route_ready_once(slot));
+    EXPECT_EQ(slot.payload->early_dispatch_state.load(), EARLY_DISPATCH_DISPATCHED);
+    for (int owner = 0; owner < 3; ++owner) {
+        EXPECT_EQ(sched.static_mix_ready_queues[owner].pop_single_consumer(), &slot);
+        EXPECT_EQ(sched.static_mix_ready_queues[owner].pop_single_consumer(), nullptr);
+    }
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::MIX)].size(), 0u);
+}
+
+TEST_F(SchedulerStateTest, FixedMixEarlyReadyRaceEnqueuesOwnersOnce) {
+    sched.static_sched_threads = 3;
+    for (int repeat = 0; repeat < 32; ++repeat) {
+        ChipTaskSlotState slot;
+        TaskDescriptor descriptor{};
+        init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+        slot.task = &descriptor;
+        slot.logical_block_num = 7;
+        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1);
+        slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+        std::thread early([&] {
+            sched.try_enqueue_early_dispatch_candidate(slot);
+        });
+        std::thread ready([&] {
+            sched.route_ready_once(slot);
+        });
+        early.join();
+        ready.join();
+        for (int owner = 0; owner < 3; ++owner) {
+            EXPECT_EQ(sched.static_mix_ready_queues[owner].pop_single_consumer(), &slot);
+            EXPECT_EQ(sched.static_mix_ready_queues[owner].pop_single_consumer(), nullptr);
+        }
+        EXPECT_EQ(sched.early_dispatch_queues[static_cast<int>(ResourceShape::MIX)].size(), 0u);
+        EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::MIX)].size(), 0u);
+    }
+}
+
+TEST_F(SchedulerStateTest, StaticAicEarlyPlacementKeepsFixedOwnersAcrossRelease) {
+    ChipTaskSlotState slot;
+    TaskDescriptor descriptor{};
+    init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+    slot.logical_block_num = 7;
+    slot.task = &descriptor;
+    slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+    sched.static_sched_threads = 3;
+    sched.try_enqueue_early_dispatch_candidate(slot);
+    EXPECT_EQ(slot.payload->early_dispatch_state.load(), EARLY_DISPATCH_STAGING);
+    EXPECT_EQ(sched.early_dispatch_queues[static_cast<int>(ResourceShape::AIC)].size(), 0u);
+    slot.next_block_idx.store(1);
+    ASSERT_TRUE(sched.route_ready_once(slot));
+    EXPECT_EQ(slot.payload->early_dispatch_state.load(), EARLY_DISPATCH_DISPATCHED);
+    for (int owner = 0; owner < 3; ++owner) {
+        EXPECT_EQ(sched.static_ready_queues[owner].pop_single_consumer(), &slot);
+        EXPECT_EQ(sched.static_ready_queues[owner].pop_single_consumer(), nullptr);
+    }
+    EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIC)].size(), 0u);
+}
+
+TEST_F(SchedulerStateTest, FixedAicEarlyReadyRaceEnqueuesOwnersOnce) {
+    sched.static_sched_threads = 3;
+    for (int repeat = 0; repeat < 32; ++repeat) {
+        ChipTaskSlotState slot;
+        TaskDescriptor descriptor{};
+        init_slot(slot, CHIP_TASK_PENDING, 0, 0);
+        slot.task = &descriptor;
+        slot.logical_block_num = 7;
+        slot.lifecycle_flags.fetch_or(STATIC_BLOCK_MAPPING);
+        std::thread early([&] {
+            sched.try_enqueue_early_dispatch_candidate(slot);
+        });
+        std::thread ready([&] {
+            sched.route_ready_once(slot);
+        });
+        early.join();
+        ready.join();
+        for (int owner = 0; owner < 3; ++owner) {
+            EXPECT_EQ(sched.static_ready_queues[owner].pop_single_consumer(), &slot);
+            EXPECT_EQ(sched.static_ready_queues[owner].pop_single_consumer(), nullptr);
+        }
+        EXPECT_EQ(sched.early_dispatch_queues[static_cast<int>(ResourceShape::AIC)].size(), 0u);
+        EXPECT_EQ(sched.ready_queues[static_cast<int>(ResourceShape::AIC)].size(), 0u);
+    }
 }

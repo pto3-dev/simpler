@@ -141,6 +141,11 @@ SchedulerState::reserve_layout(DeviceArena &arena, const int32_t dep_pool_capaci
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
     }
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; ++i) {
+        layout.off_static_ready_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+        layout.off_static_aiv_ready_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+        layout.off_static_mix_ready_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
+    }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, CHIP_READY_QUEUE_SIZE);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
@@ -183,6 +188,24 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
             )) {
             return false;
         }
+    }
+    sched->static_sched_threads = 0;
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; ++i) {
+        if (!ready_queue_init_data_from_layout(
+                &sched->static_ready_queues[i], arena, layout.off_static_ready_queue_slots[i],
+                layout.ready_queue_capacity
+            ))
+            return false;
+        if (!ready_queue_init_data_from_layout(
+                &sched->static_aiv_ready_queues[i], arena, layout.off_static_aiv_ready_queue_slots[i],
+                layout.ready_queue_capacity
+            ))
+            return false;
+        if (!ready_queue_init_data_from_layout(
+                &sched->static_mix_ready_queues[i], arena, layout.off_static_mix_ready_queue_slots[i],
+                layout.ready_queue_capacity
+            ))
+            return false;
     }
     if (!ready_queue_init_data_from_layout(
             &sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity
@@ -234,6 +257,13 @@ void SchedulerState::reset_for_reuse(const SchedulerLayout &layout, void *sm_dev
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         sched->ready_sync_queues[i].reset_for_reuse();
     }
+    sched->static_sched_threads = 0;
+    for (auto &queue : sched->static_ready_queues)
+        queue.reset_for_reuse();
+    for (auto &queue : sched->static_aiv_ready_queues)
+        queue.reset_for_reuse();
+    for (auto &queue : sched->static_mix_ready_queues)
+        queue.reset_for_reuse();
     sched->dummy_ready_queue.reset_for_reuse();
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         sched->early_dispatch_queues[i].reset_for_reuse();
@@ -251,6 +281,15 @@ void SchedulerState::wire_arena_pointers(const SchedulerLayout &layout, DeviceAr
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(&sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i]);
+    }
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; ++i) {
+        ready_queue_wire_arena_pointers(&sched->static_ready_queues[i], arena, layout.off_static_ready_queue_slots[i]);
+        ready_queue_wire_arena_pointers(
+            &sched->static_aiv_ready_queues[i], arena, layout.off_static_aiv_ready_queue_slots[i]
+        );
+        ready_queue_wire_arena_pointers(
+            &sched->static_mix_ready_queues[i], arena, layout.off_static_mix_ready_queue_slots[i]
+        );
     }
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
@@ -277,6 +316,12 @@ void SchedulerState::destroy() {
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->ready_sync_queues[i]);
     }
+    for (auto &queue : sched->static_ready_queues)
+        ready_queue_destroy(&queue);
+    for (auto &queue : sched->static_aiv_ready_queues)
+        ready_queue_destroy(&queue);
+    for (auto &queue : sched->static_mix_ready_queues)
+        ready_queue_destroy(&queue);
     ready_queue_destroy(&sched->dummy_ready_queue);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->early_dispatch_queues[i]);

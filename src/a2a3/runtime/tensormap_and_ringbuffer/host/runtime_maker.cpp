@@ -799,11 +799,10 @@ static bool build_and_cache_prebuilt_arena(
 }
 
 /**
- * This runtime resolves a kernel entry from the CoreCallable object the
- * dispatch path is handed, so its registration blocks carry the object table
- * alone and no resolved-entry view is built for them.
+ * The scheduler uses the object-address table. Device-resident programs use
+ * the resolved-entry sibling, retained by the same callable registration.
  */
-extern "C" bool runtime_uses_callable_entry_table_impl() { return false; }
+extern "C" bool runtime_uses_callable_entry_table_impl() { return true; }
 
 /**
  * Per-run binding: build device-side argument storage (tensor copy-out, GM
