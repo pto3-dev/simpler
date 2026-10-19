@@ -10,6 +10,7 @@
  */
 
 #include "worker_manager.h"
+#include "mpi_group_mailbox.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -320,6 +321,15 @@ std::string LocalMailboxEndpoint::check_child_death() {
     return child_death_reason_;
 }
 
+void mailbox_notify_work(void *mailbox) noexcept {
+    auto *base = static_cast<char *>(mailbox);
+    auto *capability = reinterpret_cast<int32_t *>(base + MAILBOX_OFF_WAKE_CAPABILITY);
+    auto *sequence = reinterpret_cast<int32_t *>(base + MAILBOX_OFF_WAKE_SEQUENCE);
+    __atomic_store_n(capability, 1, __ATOMIC_RELEASE);
+    __atomic_fetch_add(sequence, 1, __ATOMIC_RELEASE);
+    mpi_group_mailbox::wake_word(sequence);
+}
+
 MailboxState LocalMailboxEndpoint::read_mailbox_state(const char *frame) const {
     const char *base = frame == nullptr ? mbox() : frame;
     volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(const_cast<char *>(base) + MAILBOX_OFF_STATE);
@@ -347,6 +357,10 @@ void LocalMailboxEndpoint::write_mailbox_state(MailboxState s, char *frame) {
 #else
     __atomic_store(ptr, &v, __ATOMIC_RELEASE);
 #endif
+    if (s == MailboxState::TASK_READY || s == MailboxState::PREPARE_READY || s == MailboxState::CONTROL_REQUEST ||
+        s == MailboxState::SHUTDOWN) {
+        mailbox_notify_work(mailbox_);
+    }
 }
 
 bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxState desired) noexcept {
@@ -1143,6 +1157,7 @@ bool LocalMailboxEndpoint::try_publish_activation(EntryRecord &record, MailboxRu
             &entry->state, &expected, static_cast<int32_t>(MailboxState::ACTIVATE), false, __ATOMIC_ACQ_REL,
             __ATOMIC_ACQUIRE
         )) {
+        mailbox_notify_work(mailbox_);
         record.activation_published = true;
     }
     return record.activation_published;

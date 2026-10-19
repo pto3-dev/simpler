@@ -1027,6 +1027,9 @@ inline void bind_worker(nb::module_ &m) {
     // The teardown record's placement and size, so the Python producer and
     // consumer cannot drift from the C++ trailer layout.
     m.attr("MAILBOX_OFF_TEARDOWN_REPORT") = static_cast<int>(MAILBOX_OFF_TEARDOWN_REPORT);
+    m.attr("MAILBOX_OFF_WAKE_SEQUENCE") = static_cast<int>(MAILBOX_OFF_WAKE_SEQUENCE);
+    m.attr("MAILBOX_OFF_WAKE_CAPABILITY") = static_cast<int>(MAILBOX_OFF_WAKE_CAPABILITY);
+
     m.attr("SIMPLER_TEARDOWN_REPORT_BYTES") = static_cast<int>(SIMPLER_TEARDOWN_REPORT_BYTES);
     m.attr("TEARDOWN_REPORT_SCHEMA") = static_cast<int>(TEARDOWN_REPORT_SCHEMA);
     m.attr("MAILBOX_ARGS_CAPACITY") = static_cast<int>(MAILBOX_ARGS_CAPACITY);
@@ -1064,6 +1067,16 @@ inline void bind_worker(nb::module_ &m) {
             mailbox_store_u64(addr, value);
         },
         nb::arg("addr"), nb::arg("value"), "Release-store a 64-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_mailbox_notify_work",
+        [](uint64_t addr) {
+            if (addr == 0 || addr % alignof(int32_t) != 0) {
+                throw std::invalid_argument("Invalid mailbox wake address");
+            }
+            mailbox_notify_work(reinterpret_cast<void *>(addr));
+        },
+        nb::arg("addr"), "Publish a mailbox wake generation after work or shutdown is visible."
     );
     m.def(
         "_mailbox_wait_i32",
