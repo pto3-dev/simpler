@@ -261,7 +261,7 @@ The entry takes one GM pointer to an array of tensor descriptor addresses. Pass
 contiguous CPU tensors matching its static signature; FP16 and FP32 are supported.
 Use it as a context manager to drain and release its owned stream and context.
 The managed ISA pin includes the A1 profile together with the existing runtime
-baseline fixes. All tensors are copied back after each call. Exact aliases preserve shared device
+baseline fixes. CPU-carrier calls copy all tensors back after each call. Exact aliases preserve shared device
 storage; partially overlapping views are rejected. This path does not reset the
 device or finalize the process-wide ACL runtime.
 
@@ -279,3 +279,16 @@ from that header plus the child's recorded offset and writes it into
 - **Full Python API** via nanobind with torch integration
 - **Modular design** enables parallel component development
 - **Runtime linking** via binary loading
+
+A1 sessions additionally provide `upload`, `empty`, `register_kernel` and `run_device` for synchronous multi-kernel execution with session-owned FP16/FP32 tensors. `A1DeviceTensor.view` creates bounded dense views; `copy_from` and `to_cpu` are explicit transfers. Kernels may use 1 through 8 blocks and registered images share the session context. Calls synchronize before returning; this is not graph capture or asynchronous scheduling. Cross-session tensor arguments and out-of-bounds/dtype-changing views are rejected. Closing the session drains its stream before releasing all tensors and images.
+
+### A1 prepared device models
+
+`A1SingleLaunch.prepare_graph(calls)` binds the same immutable resident arguments
+as `prepare_sequence`, but prepares a CANN device model. Replay makes one
+`rtModelExecute` call and a final stream wait; per-kernel launches occur only
+during preparation. Device stream order establishes dependencies. The session
+retains descriptors, tensors, registered images and the model until close.
+This static device-model backend does not implement A2/A3 AICPU orchestration.
+The focused `tests/ut/py/test_a1_device_tensor.py` graph cases check dependent
+FP16/FP32 kernels, changing inputs, in-place writes, guards and closed handles.
