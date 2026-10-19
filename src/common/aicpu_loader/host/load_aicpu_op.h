@@ -44,12 +44,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "common/kernel_args.h"
 #include "runtime/runtime/rts/rts_kernel.h"
 #include "runtime/rt.h"
 
