@@ -193,6 +193,8 @@ This builds the nanobind `_task_interface` extension **and** pre-builds runtime 
 | `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for a2a3 onboard (and a5 onboard when the SDMA overlay is enabled), so a pin bump invalidates stale runtime objects automatically. |
 
 A1 single-launch device kernels also compile against the pinned checkout.
+The pin includes hardware image/im2col and bounded N16 multi-K GEMM with
+ZZ Left operands, alongside the vector row-broadcast implementation.
 The A1 vector row-broadcast implementation preserves FP16/FP32 bit patterns
 without scalar UB reads on its supported shapes; changing the pin requires
 rebuilding this checkout and propagating its runtime revision to PyPTO before
