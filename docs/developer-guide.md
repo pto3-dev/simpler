@@ -203,6 +203,10 @@ Aligned C16 Mat panels can also be inserted into ZZ Left subregions through
 MTE1, preserving the rest of L0A. The pin retains release-build offset guards;
 matching compiler support must prove aligned bounds and order L1 production,
 MTE1 reads, Cube consumption and buffer reuse.
+The A1 column broadcast uses zero-source-stride vector repeats to copy
+FP16/FP32 bits without per-row scalar setup. It preserves signed zeros,
+subnormals and NaN payloads, bounds repeat counts/strides and retains a
+one-row fallback for wide destinations. Same-base aliases keep the source row.
 The A1 vector row-broadcast implementation preserves FP16/FP32 bit patterns
 without scalar UB reads on its supported shapes; changing the pin requires
 rebuilding this checkout and propagating its runtime revision to PyPTO before
