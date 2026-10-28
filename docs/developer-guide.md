@@ -195,6 +195,10 @@ This builds the nanobind `_task_interface` extension **and** pre-builds runtime 
 A1 single-launch device kernels also compile against the pinned checkout.
 The pin includes hardware image/im2col and bounded N16 multi-K GEMM with
 ZZ Left operands, alongside the vector row-broadcast implementation.
+It also includes FP16 Vec-to-Mat movement through MTE3, boxing complete ND
+rows into ZZ/NZ C16 panels without GM staging. Callers must order the UB
+producer, MTE3 copy, L1 consumer and subsequent buffer reuse; matching compiler
+support supplies these dependencies for public tile moves.
 The A1 vector row-broadcast implementation preserves FP16/FP32 bit patterns
 without scalar UB reads on its supported shapes; changing the pin requires
 rebuilding this checkout and propagating its runtime revision to PyPTO before
