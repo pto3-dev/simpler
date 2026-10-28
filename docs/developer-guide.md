@@ -203,6 +203,10 @@ Aligned C16 Mat panels can also be inserted into ZZ Left subregions through
 MTE1, preserving the rest of L0A. The pin retains release-build offset guards;
 matching compiler support must prove aligned bounds and order L1 production,
 MTE1 reads, Cube consumption and buffer reuse.
+Public A1 `TMAX` supports full aligned FP16/FP32 Vec operands and local V
+event dependencies. Either exact input alias is supported; shifted output
+aliases trap before arithmetic. Finite-value, masked-tail and repeat-boundary
+regressions qualify the pin; NaN selection is not yet qualified.
 The A1 column broadcast uses zero-source-stride vector repeats to copy
 FP16/FP32 bits without per-row scalar setup. It preserves signed zeros,
 subnormals and NaN payloads, bounds repeat counts/strides and retains a
