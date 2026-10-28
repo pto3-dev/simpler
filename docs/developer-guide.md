@@ -199,6 +199,10 @@ It also includes FP16 Vec-to-Mat movement through MTE3, boxing complete ND
 rows into ZZ/NZ C16 panels without GM staging. Callers must order the UB
 producer, MTE3 copy, L1 consumer and subsequent buffer reuse; matching compiler
 support supplies these dependencies for public tile moves.
+Aligned C16 Mat panels can also be inserted into ZZ Left subregions through
+MTE1, preserving the rest of L0A. The pin retains release-build offset guards;
+matching compiler support must prove aligned bounds and order L1 production,
+MTE1 reads, Cube consumption and buffer reuse.
 The A1 vector row-broadcast implementation preserves FP16/FP32 bit patterns
 without scalar UB reads on its supported shapes; changing the pin requires
 rebuilding this checkout and propagating its runtime revision to PyPTO before
