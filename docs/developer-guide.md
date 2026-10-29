@@ -207,6 +207,11 @@ Public A1 `TMAX` supports full aligned FP16/FP32 Vec operands and local V
 event dependencies. Either exact input alias is supported; shifted output
 aliases trap before arithmetic. Finite-value, masked-tail and repeat-boundary
 regressions qualify the pin; NaN selection is not yet qualified.
+Public A1 `TRESHAPE` aliases full contiguous row-major FP16/FP32 Vec views
+with equal element types and counts; it issues no memory copy. Both views
+require full static valid shapes, unboxed storage and 32-byte-aligned rows.
+Matching compiler support preserves producer and consumer dependencies through
+reshape chains. Matrix, packed-column and dtype reinterpretation remain unsupported.
 The A1 column broadcast uses zero-source-stride vector repeats to copy
 FP16/FP32 bits without per-row scalar setup. It preserves signed zeros,
 subnormals and NaN payloads, bounds repeat counts/strides and retains a
