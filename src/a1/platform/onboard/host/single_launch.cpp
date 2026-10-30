@@ -46,6 +46,8 @@ static_assert(std::is_standard_layout_v<HostTensorArg> && std::is_trivially_copy
 static_assert(sizeof(HostTensorArg) == 48);
 static_assert(static_cast<uint32_t>(DataType::FLOAT32) == 0);
 static_assert(static_cast<uint32_t>(DataType::FLOAT16) == 1);
+static_assert(static_cast<uint32_t>(DataType::INT32) == 2);
+static_assert(static_cast<uint32_t>(DataType::UINT32) == 10);
 using KernelTensor = simpler::tmr::Tensor;
 static_assert(std::is_standard_layout_v<KernelTensor> && std::is_trivially_copyable_v<KernelTensor>);
 static_assert(sizeof(KernelTensor) == 128);
@@ -94,8 +96,9 @@ void Validate(const HostTensorArg &arg) {
         throw std::invalid_argument("invalid host tensor address or rank");
     }
     if (arg.dtype != static_cast<uint32_t>(DataType::FLOAT16) &&
-        arg.dtype != static_cast<uint32_t>(DataType::FLOAT32)) {
-        throw std::invalid_argument("A1 single launch requires FP16 or FP32");
+        arg.dtype != static_cast<uint32_t>(DataType::FLOAT32) && arg.dtype != static_cast<uint32_t>(DataType::INT32) &&
+        arg.dtype != static_cast<uint32_t>(DataType::UINT32)) {
+        throw std::invalid_argument("A1 single launch requires FP16, FP32, INT32 or UINT32");
     }
     uint64_t elements = 1;
     for (uint32_t i = 0; i < arg.rank; ++i) {

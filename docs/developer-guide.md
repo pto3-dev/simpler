@@ -292,7 +292,9 @@ orchestration or the persistent-worker `compile_incore` API.
 
 `A1SingleLaunch(kernel_object, device_id=0)` executes such an entry synchronously.
 The entry takes one GM pointer to an array of tensor descriptor addresses. Pass
-contiguous CPU tensors matching its static signature; FP16 and FP32 are supported.
+contiguous CPU tensors matching its static signature; FP16, FP32, INT32 and UINT32
+are supported. Integer carriers preserve their existing common DataType tags and
+use four-byte elements; this does not enable integer arithmetic instructions.
 Use it as a context manager to drain and release its owned stream and context.
 The managed ISA pin includes the A1 profile together with the existing runtime
 baseline fixes. CPU-carrier calls copy all tensors back after each call. Exact aliases preserve shared device
@@ -321,7 +323,7 @@ registration owns; a run references those vectors' own addresses.
 - **Modular design** enables parallel component development
 - **Runtime linking** via binary loading
 
-A1 sessions additionally provide `upload`, `empty`, `register_kernel` and `run_device` for synchronous multi-kernel execution with session-owned FP16/FP32 tensors. `A1DeviceTensor.view` creates bounded dense views; `copy_from` and `to_cpu` are explicit transfers. Kernels may use 1 through 8 blocks and registered images share the session context. Calls synchronize before returning; this is not graph capture or asynchronous scheduling. Cross-session tensor arguments and out-of-bounds/dtype-changing views are rejected. Closing the session drains its stream before releasing all tensors and images.
+A1 sessions additionally provide `upload`, `empty`, `register_kernel` and `run_device` for synchronous multi-kernel execution with session-owned FP16/FP32/INT32/UINT32 tensors. `A1DeviceTensor.view` creates bounded dense views; `copy_from` and `to_cpu` are explicit transfers. Kernels may use 1 through 8 blocks and registered images share the session context. Calls synchronize before returning; this is not graph capture or asynchronous scheduling. Cross-session tensor arguments and out-of-bounds/dtype-changing views are rejected. Closing the session drains its stream before releasing all tensors and images.
 
 ### A1 prepared device models
 
