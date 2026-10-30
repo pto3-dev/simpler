@@ -136,6 +136,22 @@ def _load_runtime() -> Any:
     return library
 
 
+def _dtype_info(dtype: Any) -> tuple[int, int]:
+    import torch  # noqa: PLC0415
+
+    # Tags are the existing common DataType ABI; the native validator asserts
+    # their values and accepts only these two- and four-byte storage types.
+    for candidate, tag, element_bytes in (
+        (torch.float32, 0, 4),
+        (torch.float16, 1, 2),
+        (torch.int32, 2, 4),
+        (torch.uint32, 10, 4),
+    ):
+        if dtype == candidate:
+            return tag, element_bytes
+    raise ValueError("A1 tensors require FP16, FP32, INT32 or UINT32")
+
+
 def _tensor_arg(tensor: Any) -> _HostTensorArg:
     import torch  # noqa: PLC0415
 
@@ -143,8 +159,7 @@ def _tensor_arg(tensor: Any) -> _HostTensorArg:
         raise TypeError("A1 single launch accepts torch tensors")
     if tensor.device.type != "cpu" or not tensor.is_contiguous():
         raise ValueError("A1 single launch requires contiguous CPU tensors")
-    if tensor.dtype not in (torch.float16, torch.float32):
-        raise ValueError("A1 single launch requires FP16 or FP32 tensors")
+    dtype_tag, element_bytes = _dtype_info(tensor.dtype)
     shape = list(tensor.shape)
     if not 1 <= len(shape) <= 5 or any(not 0 < size <= 0xFFFFFFFF for size in shape):
         raise ValueError("tensor shape exceeds the A1 kernel ABI")
@@ -152,8 +167,8 @@ def _tensor_arg(tensor: Any) -> _HostTensorArg:
         raise ValueError("tensor element count exceeds the A1 kernel ABI")
     return _HostTensorArg(
         tensor.data_ptr(),
-        tensor.numel() * tensor.element_size(),
-        1 if tensor.dtype == torch.float16 else 0,
+        tensor.numel() * element_bytes,
+        dtype_tag,
         len(shape),
         (ctypes.c_uint32 * 5)(*(shape + [0] * (5 - len(shape)))),
     )
@@ -212,10 +227,7 @@ class A1DeviceTensor:
 
 
 def _geometry(shape: tuple[int, ...], dtype: Any, address: int = 1) -> _HostTensorArg:
-    import torch  # noqa: PLC0415
-
-    if dtype not in (torch.float16, torch.float32):
-        raise ValueError("resident tensors require FP16 or FP32")
+    dtype_tag, element_bytes = _dtype_info(dtype)
     if not 1 <= len(shape) <= 5 or any(
         isinstance(x, bool) or not isinstance(x, int) or not 0 < x <= 0xFFFFFFFF for x in shape
     ):
@@ -227,8 +239,8 @@ def _geometry(shape: tuple[int, ...], dtype: Any, address: int = 1) -> _HostTens
         raise ValueError("resident tensor element count exceeds the A1 kernel ABI")
     return _HostTensorArg(
         address,
-        elements * (2 if dtype == torch.float16 else 4),
-        1 if dtype == torch.float16 else 0,
+        elements * element_bytes,
+        dtype_tag,
         len(shape),
         (ctypes.c_uint32 * 5)(*shape),
     )

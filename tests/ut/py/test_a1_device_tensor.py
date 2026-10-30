@@ -25,7 +25,13 @@ def test_resident_geometry_rejects_invalid_extents(shape):
         module._geometry(shape, torch.float32)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.int16, torch.int64, torch.float64])
+def test_resident_geometry_rejects_unsupported_storage_types(dtype):
+    with pytest.raises(ValueError):
+        module._geometry((2, 128), dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.int32, torch.uint32])
 def test_dense_view_geometry_and_parent_bounds(dtype):
     owner = object.__new__(A1SingleLaunch)
     tensor = A1DeviceTensor(owner, 7, (2, 128), dtype, 256 * (2 if dtype == torch.float16 else 4))

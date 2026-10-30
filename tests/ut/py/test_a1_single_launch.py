@@ -9,6 +9,8 @@
 """Argument and lifetime contracts of the synchronous A1 launcher."""
 
 import ctypes
+import platform
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -17,8 +19,11 @@ import torch
 from simpler_setup import a1_single_launch
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_host_tensor_geometry_matches_native_descriptor(dtype):
+@pytest.mark.parametrize(
+    ("dtype", "native_dtype"),
+    [(torch.float16, 1), (torch.float32, 0), (torch.int32, 2), (torch.uint32, 10)],
+)
+def test_host_tensor_geometry_matches_native_descriptor(dtype, native_dtype):
     tensor = torch.empty((16, 128), dtype=dtype)
     arg = a1_single_launch._tensor_arg(tensor)
     assert ctypes.sizeof(arg) == 48
@@ -26,12 +31,21 @@ def test_host_tensor_geometry_matches_native_descriptor(dtype):
     assert arg.bytes == tensor.numel() * tensor.element_size()
     assert arg.rank == 2
     assert list(arg.shape) == [16, 128, 0, 0, 0]
-    assert arg.dtype == (1 if dtype == torch.float16 else 0)
+    assert arg.dtype == native_dtype
 
 
 @pytest.mark.parametrize(
     "tensor",
-    [torch.empty((8, 8)).t(), torch.empty((0, 128)), torch.tensor(1.0), torch.empty((16, 128), dtype=torch.bfloat16)],
+    [
+        torch.empty((8, 8)).t(),
+        torch.empty((0, 128)),
+        torch.tensor(1.0),
+        torch.empty((16, 128), dtype=torch.bfloat16),
+        torch.empty((16, 128), dtype=torch.int16),
+        torch.empty((16, 128), dtype=torch.int64),
+        torch.empty((16, 128), dtype=torch.float64),
+        torch.empty((16, 128), dtype=torch.uint8),
+    ],
 )
 def test_unsupported_carriers_fail_before_native_dispatch(tensor):
     with pytest.raises(ValueError):
@@ -74,6 +88,49 @@ def test_invalid_object_does_not_initialize_acl(monkeypatch):
     monkeypatch.setattr(a1_single_launch, "_load_runtime", unexpected_load)
     with pytest.raises(ValueError, match="ELF"):
         a1_single_launch.A1SingleLaunch(b"not an ELF")
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="requires ELF section garbage collection")
+def test_native_host_descriptor_validation_without_device(tmp_path):
+    try:
+        a1_single_launch.env_manager.ensure("ASCEND_HOME_PATH")
+    except OSError:
+        pytest.skip("requires CANN headers for the CPU descriptor probe")
+    toolchain = a1_single_launch.GxxToolchain()
+    if toolchain.ascend_home_path is None:
+        pytest.skip("requires CANN headers for the CPU descriptor probe")
+    root = Path(__file__).resolve().parents[3]
+    sdk = Path(toolchain.ascend_home_path)
+    common = root / "src/common"
+    source = Path(__file__).parent / "support/a1_tensor_descriptor_probe.cpp"
+    binary = tmp_path / "descriptor"
+    # Only Validate is reachable: unused device functions are discarded, and
+    # no CANN libraries are linked or loaded by this CPU executable.
+    subprocess.run(
+        [
+            toolchain.cxx_path,
+            "-std=c++17",
+            "-O1",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wl,--gc-sections",
+            f"-I{root}",
+            f"-I{sdk / 'include'}",
+            f"-I{sdk / 'pkg_inc'}",
+            f"-I{sdk / 'pkg_inc/runtime'}",
+            f"-I{sdk / (platform.machine() + '-linux') / 'pkg_inc'}",
+            f"-I{sdk / (platform.machine() + '-linux') / 'pkg_inc/runtime'}",
+            f"-I{common}",
+            f"-I{common / 'task_interface'}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
 
 
 @pytest.mark.requires_hardware("a1")
