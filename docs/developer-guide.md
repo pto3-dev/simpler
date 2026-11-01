@@ -195,6 +195,12 @@ This builds the nanobind `_task_interface` extension **and** pre-builds runtime 
 A1 single-launch device kernels also compile against the pinned checkout.
 The pin includes hardware image/im2col and bounded N16 multi-K GEMM with
 ZZ Left operands, alongside the vector row-broadcast implementation.
+A1 static assignments admit the full 1 MiB L1 budget. The optional
+`TIMG2COL` filter selection accepts 1–127 unique spatial taps, writes a
+complete Left tile through V1 M-repeat, and interprets K as an original
+full-filter C16 group. Its default interface retains contiguous V2 behavior.
+Matching compiler support must validate tap bounds, complete output extents
+and signed V1 coordinates; selecting taps does not change accumulation order.
 It also includes FP16 Vec-to-Mat movement through MTE3, boxing complete ND
 rows into ZZ/NZ C16 panels without GM staging. Callers must order the UB
 producer, MTE3 copy, L1 consumer and subsequent buffer reuse; matching compiler
