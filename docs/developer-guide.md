@@ -303,7 +303,11 @@ are supported. Integer carriers preserve their existing common DataType tags and
 use four-byte elements; this does not enable integer arithmetic instructions.
 Use it as a context manager to drain and release its owned stream and context.
 The managed ISA pin includes the A1 profile together with the existing runtime
-baseline fixes. CPU-carrier calls copy all tensors back after each call. Exact aliases preserve shared device
+baseline fixes. The A1 matrix path supports full-capacity resident L1 panels,
+row-strided Vec-to-Mat insertion and C16-block-strided Mat-to-Right extraction
+through the existing `TINSERT` and `TEXTRACT` instructions. These are kernel
+capabilities; the pin alone does not enable a model path or establish device
+correctness or performance. CPU-carrier calls copy all tensors back after each call. Exact aliases preserve shared device
 storage; partially overlapping views are rejected. This path does not reset the
 device or finalize the process-wide ACL runtime.
 
