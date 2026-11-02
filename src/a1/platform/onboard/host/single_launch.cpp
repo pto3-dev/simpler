@@ -12,7 +12,6 @@
 #include <acl/acl.h>
 #include <runtime/rt.h>
 #include <runtime/rt_model.h>
-#include <runtime/rt_preload_task.h>
 
 #include <cstdint>
 #include <cstring>
@@ -24,6 +23,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "../../include/l2_cache.h"
 #include "tensormap_and_ringbuffer/tensor.h"
 
 namespace {
@@ -116,16 +116,8 @@ void Validate(const HostTensorArg &arg) {
 
 constexpr uint32_t kArgumentAbiVersion = 2;
 
-struct L2CacheInfo {
-    uint64_t alias_offset;
-    int32_t query_status;
-};
-
-L2CacheInfo QueryL2CacheOffset(uint32_t device, decltype(&rtGetL2CacheOffset) query) {
-    uint64_t offset = 0;
-    const int32_t status = query(device, &offset);
-    return {status == RT_ERROR_NONE ? offset : 0, status};
-}
+using simpler::a1::L2CacheInfo;
+using simpler::a1::QueryL2CacheOffset;
 
 std::vector<uint64_t> ArgumentSlots(
     uint64_t descriptor_address, const uint32_t *counts, uint32_t call_count, uint32_t abi_version,

@@ -333,6 +333,14 @@ alone neither redirects loads nor establishes performance; the compiler must
 apply the offset only to reads declaring the existing public bypass policy.
 Tensor pointers, views, writes and ordinary reads retain their original address.
 
+Custom A1 host entries can reuse the same query through
+`src/a1/platform/include/l2_cache.h`: select the owned device context, then call
+`simpler::a1::QueryL2CacheOffset(device_id)`. It returns `L2CacheInfo` with the
+same zero-on-error and original-status contract as `A1SingleLaunch`. The header
+performs no work on inclusion and has no session or allocation side effects;
+the caller decides when to query and how to transport the result. An optional
+query-function parameter supports CPU-only tests without linking a driver.
+
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
 child `CoreCallable`) and registered once via
 `DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each
