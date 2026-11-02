@@ -15,12 +15,21 @@ import threading
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, NamedTuple
 
 from simpler import env_manager
 
 from .environment import PROJECT_ROOT
 from .toolchain import GxxToolchain
+
+A1_ARGUMENT_ABI_VERSION = 2
+
+
+class A1L2CacheInfo(NamedTuple):
+    """Session-cached driver result; an error always carries a zero alias offset."""
+
+    alias_offset: int
+    query_status: int
 
 
 class _HostTensorArg(ctypes.Structure):
@@ -66,6 +75,7 @@ def _load_runtime() -> Any:
             "-lruntime",
             "-ldl",
             "-pthread",
+            "-Wl,--no-undefined",
             "-o",
             output,
         ]
@@ -73,6 +83,16 @@ def _load_runtime() -> Any:
         if result.returncode:
             raise RuntimeError(f"A1 host runtime compilation failed:\n{result.stderr}")
         library = ctypes.CDLL(output)
+    library.simpler_a1_argument_abi_version.argtypes = []
+    library.simpler_a1_argument_abi_version.restype = ctypes.c_uint32
+    if library.simpler_a1_argument_abi_version() != A1_ARGUMENT_ABI_VERSION:
+        raise RuntimeError("A1 launch argument ABI version mismatch")
+    library.simpler_a1_l2_cache_info.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    library.simpler_a1_l2_cache_info.restype = ctypes.c_int
     library.simpler_a1_create.argtypes = [
         ctypes.c_void_p,
         ctypes.c_uint64,
@@ -80,6 +100,8 @@ def _load_runtime() -> Any:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     library.simpler_a1_create.restype = ctypes.c_int
+    library.simpler_a1_create_v2.argtypes = library.simpler_a1_create.argtypes
+    library.simpler_a1_create_v2.restype = ctypes.c_int
     library.simpler_a1_run.argtypes = [ctypes.c_void_p, ctypes.POINTER(_HostTensorArg), ctypes.c_uint32]
     library.simpler_a1_run.restype = ctypes.c_int
     library.simpler_a1_close.argtypes = [ctypes.c_void_p]
@@ -258,21 +280,46 @@ class A1SingleLaunch:
     without resetting the device or finalizing the process-wide ACL runtime.
     """
 
-    def __init__(self, kernel: bytes, device_id: int = 0):
+    def __init__(self, kernel: bytes, device_id: int = 0, *, argument_abi_version: int = 1):
         if not isinstance(kernel, bytes) or not kernel.startswith(b"\x7fELF"):
             raise ValueError("kernel must be a CANN-loadable ELF object")
         if isinstance(device_id, bool) or not isinstance(device_id, int) or not 0 <= device_id <= 0x7FFFFFFF:
             raise ValueError("device_id must be a nonnegative int32")
+        if type(argument_abi_version) is not int or argument_abi_version not in (1, A1_ARGUMENT_ABI_VERSION):
+            raise ValueError("A1 argument ABI version must be 1 or 2")
+        self._argument_abi_version = argument_abi_version
         self._lock = threading.RLock()
         self._handle = ctypes.c_void_p()
         self._library = _load_runtime()
         image = ctypes.create_string_buffer(kernel)
-        self._check(self._library.simpler_a1_create(image, len(kernel), device_id, ctypes.byref(self._handle)))
+        create = self._library.simpler_a1_create if argument_abi_version == 1 else self._library.simpler_a1_create_v2
+        self._check(create(image, len(kernel), device_id, ctypes.byref(self._handle)))
 
     def _check(self, status: int) -> None:
         if status:
             error = self._library.simpler_a1_last_error()
             raise RuntimeError(error.decode() if error else "A1 runtime operation failed")
+
+    max_argument_abi_version = A1_ARGUMENT_ABI_VERSION
+
+    @property
+    def argument_abi_version(self) -> int:
+        """Return the immutable argument layout selected at session creation."""
+        return self._argument_abi_version
+
+    @property
+    def l2_cache_info(self) -> A1L2CacheInfo:
+        """Read the cached query result without querying or synchronizing the device."""
+        with self._lock:
+            if not self._handle.value:
+                raise RuntimeError("single launch session is closed")
+            if self._argument_abi_version != A1_ARGUMENT_ABI_VERSION:
+                raise RuntimeError("cache info requires A1 argument ABI 2")
+            offset, query_status = ctypes.c_uint64(), ctypes.c_int32()
+            self._check(
+                self._library.simpler_a1_l2_cache_info(self._handle, ctypes.byref(offset), ctypes.byref(query_status))
+            )
+            return A1L2CacheInfo(offset.value, query_status.value)
 
     def __call__(self, *tensors: Any) -> None:
         """Run the entry and synchronously update all argument tensors."""

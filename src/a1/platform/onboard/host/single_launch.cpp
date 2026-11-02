@@ -12,6 +12,7 @@
 #include <acl/acl.h>
 #include <runtime/rt.h>
 #include <runtime/rt_model.h>
+#include <runtime/rt_preload_task.h>
 
 #include <cstdint>
 #include <cstring>
@@ -113,9 +114,52 @@ void Validate(const HostTensorArg &arg) {
     }
 }
 
+constexpr uint32_t kArgumentAbiVersion = 2;
+
+struct L2CacheInfo {
+    uint64_t alias_offset;
+    int32_t query_status;
+};
+
+L2CacheInfo QueryL2CacheOffset(uint32_t device, decltype(&rtGetL2CacheOffset) query) {
+    uint64_t offset = 0;
+    const int32_t status = query(device, &offset);
+    return {status == RT_ERROR_NONE ? offset : 0, status};
+}
+
+std::vector<uint64_t> ArgumentSlots(
+    uint64_t descriptor_address, const uint32_t *counts, uint32_t call_count, uint32_t abi_version,
+    uint64_t l2_cache_offset
+) {
+    if (abi_version != 1 && abi_version != kArgumentAbiVersion)
+        throw std::invalid_argument("unsupported A1 launch argument ABI");
+    const bool footer = abi_version == kArgumentAbiVersion;
+    if (!counts || call_count == 0 || call_count > 4096)
+        throw std::invalid_argument("argument slots require 1..4096 signatures");
+    uint64_t total = 0;
+    for (uint32_t call = 0; call < call_count; ++call) {
+        if (counts[call] == 0 || counts[call] > 64)
+            throw std::invalid_argument("argument signature requires 1..64 tensors");
+        total += counts[call];
+    }
+    if (!descriptor_address || descriptor_address > UINT64_MAX - total * sizeof(KernelTensor))
+        throw std::invalid_argument("argument descriptor range overflows");
+    std::vector<uint64_t> slots;
+    slots.reserve(total + (footer ? call_count : 0));
+    uint64_t descriptor = 0;
+    for (uint32_t call = 0; call < call_count; ++call) {
+        for (uint32_t argument = 0; argument < counts[call]; ++argument)
+            slots.push_back(descriptor_address + descriptor++ * sizeof(KernelTensor));
+        // The footer is outside the tensor signature and never changes descriptors.
+        if (footer) slots.push_back(l2_cache_offset);
+    }
+    return slots;
+}
+
 class SingleLaunch {
 public:
-    SingleLaunch(const void *binary, uint64_t bytes, int32_t device) :
+    SingleLaunch(const void *binary, uint64_t bytes, int32_t device, uint32_t argument_abi = 1) :
+        argument_abi_(argument_abi),
         object_(static_cast<const char *>(binary), static_cast<const char *>(binary) + bytes) {
         const auto init_status = aclInit(nullptr);
         if (init_status != ACL_ERROR_REPEAT_INITIALIZE) {
@@ -129,6 +173,8 @@ public:
         aclrtGetCurrentContext(&previous);
         try {
             Check(aclrtCreateContext(&context_, device), "create context");
+            if (argument_abi_ == kArgumentAbiVersion)
+                l2_cache_info_ = QueryL2CacheOffset(static_cast<uint32_t>(device), rtGetL2CacheOffset);
             Check(aclrtCreateStream(&stream_), "create stream");
             rtDevBinary_t image{};
             image.magic = RT_DEV_BINARY_MAGIC_ELF;
@@ -153,6 +199,13 @@ public:
             }
             throw;
         }
+    }
+
+    L2CacheInfo CacheInfo() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        RequireOpen();
+        if (argument_abi_ != kArgumentAbiVersion) throw std::invalid_argument("cache info requires A1 argument ABI 2");
+        return l2_cache_info_;
     }
 
     void Run(const HostTensorArg *args, uint32_t count) {
@@ -337,7 +390,8 @@ public:
         ContextGuard context(context_);
         PreparedSequence sequence;
         void *descriptor_pointer = nullptr, *slot_pointer = nullptr;
-        const uint64_t descriptor_bytes = total * sizeof(KernelTensor), slot_bytes = total * sizeof(uint64_t);
+        const uint64_t descriptor_bytes = total * sizeof(KernelTensor);
+        const uint64_t slot_bytes = (total + (argument_abi_ == kArgumentAbiVersion ? count : 0)) * sizeof(uint64_t);
         Check(
             aclrtMalloc(&descriptor_pointer, descriptor_bytes, ACL_MEM_MALLOC_NORMAL_ONLY),
             "allocate sequence descriptors"
@@ -351,9 +405,9 @@ public:
             ),
             "upload sequence descriptors"
         );
-        std::vector<uint64_t> slots(total);
-        for (uint32_t i = 0; i < total; ++i)
-            slots[i] = reinterpret_cast<uint64_t>(descriptor_pointer) + i * sizeof(KernelTensor);
+        const auto slots = ArgumentSlots(
+            reinterpret_cast<uint64_t>(descriptor_pointer), counts, count, argument_abi_, l2_cache_info_.alias_offset
+        );
         Check(
             aclrtMemcpy(slot_pointer, slot_bytes, slots.data(), slot_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
             "upload sequence slots"
@@ -364,7 +418,7 @@ public:
                 {reinterpret_cast<uint64_t>(slot_pointer) + offset * sizeof(uint64_t),
                  ids[i] ? extra_kernels_[ids[i] - 1].handle : kernel_, blocks[i]}
             );
-            offset += counts[i];
+            offset += counts[i] + (argument_abi_ == kArgumentAbiVersion ? 1 : 0);
         }
         if (device_model) sequence.model = std::make_unique<DeviceModel>(sequence.calls);
         sequences_.push_back(std::move(sequence));
@@ -582,10 +636,9 @@ private:
             aclrtMemcpy(device_descriptors, descriptor_bytes, descriptors, descriptor_bytes, ACL_MEMCPY_HOST_TO_DEVICE),
             "upload descriptors"
         );
-        std::vector<uint64_t> slots(count);
-        for (uint32_t i = 0; i < count; ++i) {
-            slots[i] = reinterpret_cast<uint64_t>(device_descriptors) + i * sizeof(KernelTensor);
-        }
+        const auto slots = ArgumentSlots(
+            reinterpret_cast<uint64_t>(device_descriptors), &count, 1, argument_abi_, l2_cache_info_.alias_offset
+        );
         const uint64_t slot_bytes = slots.size() * sizeof(uint64_t);
         void *device_slots = Allocate(slot_bytes);
         Check(
@@ -601,6 +654,8 @@ private:
         Check(rtKernelLaunchWithHandleV2(kernel, 0, blocks, &launch_args, nullptr, stream_, &config), "launch kernel");
         Check(aclrtSynchronizeStreamWithTimeout(stream_, 5000), "synchronize kernel");
     }
+    uint32_t argument_abi_;
+    L2CacheInfo l2_cache_info_{};
     std::vector<ResidentBuffer> resident_;
     std::vector<ExtraKernel> extra_kernels_;
     void *Allocate(uint64_t bytes) {
@@ -630,18 +685,37 @@ int Invoke(Action action) noexcept {
     }
 }
 
-}  // namespace
-
-extern "C" const char *simpler_a1_last_error() { return last_error.c_str(); }
-
-extern "C" int simpler_a1_create(const void *binary, uint64_t bytes, int32_t device, void **result) {
+int CreateSession(const void *binary, uint64_t bytes, int32_t device, void **result, uint32_t abi_version) {
     return Invoke([&] {
         if (!binary || bytes < 4 || bytes > UINT32_MAX || !result || device < 0 ||
             std::memcmp(binary, "\177ELF", 4) != 0) {
             throw std::invalid_argument("invalid A1 ELF object or device");
         }
-        *result = new SingleLaunch(binary, bytes, device);
+        *result = new SingleLaunch(binary, bytes, device, abi_version);
     });
+}
+
+}  // namespace
+
+extern "C" const char *simpler_a1_last_error() { return last_error.c_str(); }
+
+extern "C" uint32_t simpler_a1_argument_abi_version() { return kArgumentAbiVersion; }
+
+extern "C" int simpler_a1_l2_cache_info(void *session, uint64_t *offset, int32_t *query_status) {
+    return Invoke([&] {
+        if (!session || !offset || !query_status) throw std::invalid_argument("invalid A1 cache info request");
+        const auto info = static_cast<SingleLaunch *>(session)->CacheInfo();
+        *offset = info.alias_offset;
+        *query_status = info.query_status;
+    });
+}
+
+extern "C" int simpler_a1_create(const void *binary, uint64_t bytes, int32_t device, void **result) {
+    return CreateSession(binary, bytes, device, result, 1);
+}
+
+extern "C" int simpler_a1_create_v2(const void *binary, uint64_t bytes, int32_t device, void **result) {
+    return CreateSession(binary, bytes, device, result, kArgumentAbiVersion);
 }
 
 extern "C" int simpler_a1_run(void *session, const HostTensorArg *args, uint32_t count) {
