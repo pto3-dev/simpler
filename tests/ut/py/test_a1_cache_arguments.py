@@ -62,6 +62,52 @@ def test_native_query_and_argument_contract(native_probe, mode):
     subprocess.run([str(native_probe), mode], check=True, capture_output=True, text=True)
 
 
+def test_shared_query_header_is_self_contained_without_driver_link(tmp_path):
+    a1_single_launch.env_manager.ensure("ASCEND_HOME_PATH")
+    toolchain = a1_single_launch.GxxToolchain()
+    assert toolchain.ascend_home_path is not None
+    root = Path(__file__).resolve().parents[3]
+    sdk = Path(toolchain.ascend_home_path)
+    source = tmp_path / "header.cpp"
+    source.write_text("""
+#include <cassert>
+#include "src/a1/platform/include/l2_cache.h"
+rtError_t fake(uint32_t device, uint64_t* offset) {
+    assert(device == 7);
+    *offset = UINT64_MAX;
+    return static_cast<rtError_t>(17);
+}
+int main() {
+    const auto info = simpler::a1::QueryL2CacheOffset(7, fake);
+    assert(info.alias_offset == 0);
+    assert(info.query_status == 17);
+}
+""")
+    binary = tmp_path / "header"
+    subprocess.run(
+        [
+            toolchain.cxx_path,
+            "-std=c++17",
+            "-O1",
+            f"-I{root}",
+            f"-I{sdk / 'include'}",
+            f"-I{sdk / 'pkg_inc'}",
+            f"-I{sdk / 'pkg_inc/runtime'}",
+            f"-I{sdk / (platform.machine() + '-linux') / 'pkg_inc'}",
+            f"-I{sdk / (platform.machine() + '-linux') / 'pkg_inc/runtime'}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    needed = subprocess.run(["readelf", "-d", str(binary)], check=True, capture_output=True, text=True).stdout
+    assert "libascendcl" not in needed and "libruntime" not in needed
+    subprocess.run([str(binary)], check=True, capture_output=True, text=True)
+
+
 @pytest.mark.parametrize("offset,status", [(0, 0), (1 << 40, 0), (0, 507015)])
 def test_cache_info_reads_session_state_and_preserves_status(monkeypatch, offset, status):
     class Native:
