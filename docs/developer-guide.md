@@ -311,6 +311,28 @@ correctness or performance. CPU-carrier calls copy all tensors back after each c
 storage; partially overlapping views are rejected. This path does not reset the
 device or finalize the process-wide ACL runtime.
 
+`A1SingleLaunch(..., argument_abi_version=2)` opts into A1 argument ABI 2;
+`A1SingleLaunch.max_argument_abi_version` reports the supported version and
+`session.argument_abi_version` reports the selected layout. The default is
+ABI 1: its argument layout is unchanged and it makes no L2-offset query.
+In ABI 2, each call's GM argument block contains its original tensor-descriptor addresses
+followed by one uint64 byte offset to the device's uncached L2 alias. Existing
+kernels read only their tensor slots and remain compatible. A generated entry
+that consumes the footer must check the runtime ABI before creating a session.
+For an independent-image entry, the footer follows the entire call's tensor
+array, rather than each image's subset. Prepared sequences and device models
+retain a separate footer for each call; replay does not query or upload it.
+
+An ABI 2 session queries `rtGetL2CacheOffset` once in its device context during
+initialization. `session.l2_cache_info` returns an immutable `A1L2CacheInfo`
+containing `alias_offset` and the original `query_status`, without a driver call.
+The property requires ABI 2; ABI 1 does not report a fabricated query result.
+A failed query forces the offset to zero, even if the driver wrote a value.
+A successful zero offset likewise provides no bypass effect. This transport
+alone neither redirects loads nor establishes performance; the compiler must
+apply the offset only to reads declaring the existing public bypass policy.
+Tensor pointers, views, writes and ordinary reads retain their original address.
+
 The compiled binaries are packed into a `ChipCallable` (orch SO + each
 child `CoreCallable`) and registered once via
 `DeviceRunner::upload_chip_callable_buffer(callable)`, which fixes up each
